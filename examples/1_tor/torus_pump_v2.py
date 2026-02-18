@@ -21,15 +21,12 @@ os.makedirs(output_dir, exist_ok=True)
 Lx, Ly, Lz = 24, 24, 24
 Nx, Ny, Nz = 48, 48, 48
 R_torus    = 5.0
-g_tor      = 5.0    # нелинейность тора (сильная — тор жёсткий)
-g_gas      = 0.0    # газ невзаимодействующий (не поглощается тором)
+g_tor      = 5.0    # нелинейность тора
+g_gas      = 1.5    # самовзаимодействие газа — удерживает форму сгустков
 omega_trap = 2.0
 DESIRED_PEAK = 1.0
 GAS_PEAK     = 0.5
-
-# Скорость полоидального насоса
-# Положительное v_pol — газ идёт снизу вверх внутри дырки
-V_POL = 3.0
+V_POL        = 3.0
 
 # ==============================================
 # БАЗИС
@@ -41,21 +38,20 @@ xbasis = d3.ComplexFourier(coords['x'], size=Nx, bounds=(-Lx/2, Lx/2), dealias=3
 ybasis = d3.ComplexFourier(coords['y'], size=Ny, bounds=(-Ly/2, Ly/2), dealias=3/2)
 zbasis = d3.ComplexFourier(coords['z'], size=Nz, bounds=(-Lz/2, Lz/2), dealias=3/2)
 
-# Два поля: тор (фиксированный) и газ (эволюционирует)
-psi_t  = dist.Field(name='psi_t',  bases=(xbasis, ybasis, zbasis))  # тор
-phi    = dist.Field(name='phi',    bases=(xbasis, ybasis, zbasis))  # газ
+psi_t  = dist.Field(name='psi_t',  bases=(xbasis, ybasis, zbasis))
+phi    = dist.Field(name='phi',    bases=(xbasis, ybasis, zbasis))
 V_trap = dist.Field(name='V_trap', bases=(xbasis, ybasis, zbasis))
-V_tor  = dist.Field(name='V_tor',  bases=(xbasis, ybasis, zbasis))  # потенциал от тора
-V_pol  = dist.Field(name='V_pol',  bases=(xbasis, ybasis, zbasis))  # полоидальный насос
+V_tor  = dist.Field(name='V_tor',  bases=(xbasis, ybasis, zbasis))
+V_pol  = dist.Field(name='V_pol',  bases=(xbasis, ybasis, zbasis))
+V_nl   = dist.Field(name='V_nl',   bases=(xbasis, ybasis, zbasis))
 
-x, y, z = dist.local_grids(xbasis, ybasis, zbasis)
+# ВАЖНО: получаем грид с scales=1, чтобы размер был 32x32x32, а не 48x48x48
+x, y, z = dist.local_grids(xbasis, ybasis, zbasis, scales=1)
 r_cyl   = np.sqrt(x**2 + y**2)
 
 x1d = x[:, 0, 0];  y1d = y[0, :, 0];  z1d = z[0, 0, :]
 iz0 = np.argmin(np.abs(z1d))
 iy0 = np.argmin(np.abs(y1d))
-
-V_trap['g'] = 0.5 * omega_trap**2 * ((r_cyl - R_torus)**2 + z**2)
 
 # ==============================================
 # УТИЛИТЫ
@@ -71,6 +67,11 @@ def gauss3d(cx, cy, cz, sx=1.0, sy=1.0, sz=1.5):
                     (y-cy)**2/(2*sy**2) +
                     (z-cz)**2/(2*sz**2)))
 
+def set_field(field, data):
+    """Присвоить данные полю с правильным scale=1."""
+    field.change_scales(1)
+    field['g'] = data
+
 def plot_frame(psi_t, phi, label, fname, gas_vmax=None):
     psi_t.change_scales(1); phi.change_scales(1)
     dens_tor = np.abs(psi_t['g'])**2
@@ -79,10 +80,8 @@ def plot_frame(psi_t, phi, label, fname, gas_vmax=None):
     if gas_vmax is None:
         gas_vmax = float(np.max(dens_gas)) * 1.2 or GAS_PEAK
 
-    # XY срез
     tor_xy = dens_tor[:, :, iz0]
     gas_xy = dens_gas[:, :, iz0]
-    # XZ срез
     tor_xz = dens_tor[:, iy0, :]
     gas_xz = dens_gas[:, iy0, :]
 
@@ -94,22 +93,18 @@ def plot_frame(psi_t, phi, label, fname, gas_vmax=None):
 
     tor_vmax = float(np.max(dens_tor)) or 1.0
 
-    # RGB наложение: тор — красный, газ — синий+зелёный с гамма-коррекцией.
-    # Гамма 0.5 делает слабые хвосты газа заметнее без изменения фона.
     def make_rgb(tor, gas, tor_vmax, gas_vmax):
-        r      = np.clip(tor / tor_vmax, 0, 1)
-        gas_n  = np.clip(gas / gas_vmax, 0, 1) ** 0.5  # гамма-коррекция
-        b      = gas_n
-        g_ch   = gas_n * 0.4
+        r     = np.clip(tor / tor_vmax, 0, 1)
+        gas_n = np.clip(gas / gas_vmax, 0, 1) ** 0.5  # гамма-коррекция
+        b     = gas_n
+        g_ch  = gas_n * 0.4
         return np.stack([r.T, g_ch.T, b.T], axis=-1)
 
-    rgb_xy = make_rgb(tor_xy, gas_xy, tor_vmax, gas_vmax)
-    axes[0].imshow(rgb_xy, extent=ext_xy, origin='lower')
+    axes[0].imshow(make_rgb(tor_xy, gas_xy, tor_vmax, gas_vmax), extent=ext_xy, origin='lower')
     axes[0].set_title("XY top view  (red=torus, blue=gas)")
     axes[0].set_xlabel("x"); axes[0].set_ylabel("y")
 
-    rgb_xz = make_rgb(tor_xz, gas_xz, tor_vmax, gas_vmax)
-    axes[1].imshow(rgb_xz, extent=ext_xz, origin='lower')
+    axes[1].imshow(make_rgb(tor_xz, gas_xz, tor_vmax, gas_vmax), extent=ext_xz, origin='lower')
     axes[1].set_title("XZ side view  (red=torus, blue=gas)")
     axes[1].set_xlabel("x"); axes[1].set_ylabel("z")
 
@@ -119,13 +114,24 @@ def plot_frame(psi_t, phi, label, fname, gas_vmax=None):
     logger.info(f"Saved: {fname}")
 
 # ==============================================
+# ИНИЦИАЛИЗАЦИЯ СТАТИЧЕСКИХ ПОЛЕЙ
+# ==============================================
+set_field(V_trap, 0.5 * omega_trap**2 * ((r_cyl - R_torus)**2 + z**2))
+
+d_torus_2d = np.sqrt((r_cyl - R_torus)**2 + z**2)
+pump_mask  = np.exp(-0.5 * d_torus_2d**2 / 3.0**2)
+theta_pol  = np.arctan2(z, r_cyl - R_torus)
+set_field(V_pol, -V_POL * theta_pol * pump_mask)
+
+set_field(V_nl, np.zeros((Nx, Ny, Nz)))  # пока нулевой
+
+# ==============================================
 # ФАЗА 1: РЕЛАКСАЦИЯ ТОРА
 # ==============================================
 logger.info("PHASE 1: Torus ground state")
 
-psi_t.change_scales(1)
 d_torus = np.sqrt((r_cyl - R_torus)**2 + z**2)
-psi_t['g'] = np.exp(-d_torus**2 / (2 * 1.5**2)).astype(np.complex128)
+set_field(psi_t, np.exp(-d_torus**2 / (2 * 1.5**2)).astype(np.complex128))
 normalize(psi_t)
 
 problem_relax = d3.IVP([psi_t], namespace=locals())
@@ -142,54 +148,46 @@ while solver_r.proceed:
         logger.error("NaN in torus relaxation!"); break
 
 normalize(psi_t)
-
-# Сохраняем профиль тора — он больше НЕ МЕНЯЕТСЯ
 psi_t.change_scales(1)
-torus_profile = psi_t['g'].copy()  # замороженный тор
+torus_profile = psi_t['g'].copy()
 logger.info(f"Torus ground state: peak={np.max(np.abs(torus_profile)**2):.4f}")
 
 # ==============================================
-# ФАЗА 2: ПОТЕНЦИАЛ ОТ ТОРА + ПОЛОИДАЛЬНЫЙ НАСОС
+# ФАЗА 2: ПОТЕНЦИАЛ ОТ ТОРА
 # ==============================================
-logger.info("PHASE 2: Building torus potential + poloidal pump")
-
-V_tor['g'] = g_tor * np.abs(torus_profile)**2
-
-d_torus_2d = np.sqrt((r_cyl - R_torus)**2 + z**2)
-pump_mask  = np.exp(-0.5 * d_torus_2d**2 / 3.0**2)
-theta_pol  = np.arctan2(z, r_cyl - R_torus)
-V_pol['g'] = -V_POL * theta_pol * pump_mask
+logger.info("PHASE 2: Building torus potential")
+set_field(V_tor, g_tor * np.abs(torus_profile)**2)
 
 # ==============================================
 # ФАЗА 3: НАЧАЛЬНОЕ УСЛОВИЕ ДЛЯ ГАЗА
 # ==============================================
 logger.info("PHASE 3: Setting up gas initial condition")
 
-phi.change_scales(1)
-
-phi['g'] = (
+gas_init = (
       1.0 * gauss3d( 2.0,  0.5,  0.0, sx=1.0, sy=1.0, sz=1.2)
     + 0.9 * gauss3d(-1.5,  1.5,  0.0, sx=1.0, sy=1.0, sz=1.2)
     + 0.8 * gauss3d( 0.5, -2.0,  0.0, sx=1.0, sy=1.0, sz=1.2)
     + 0.7 * gauss3d(-1.0, -1.0,  2.0, sx=0.8, sy=0.8, sz=0.8)
     + 0.7 * gauss3d( 1.5,  1.0, -2.0, sx=0.8, sy=0.8, sz=0.8)
 ).astype(np.complex128)
-
-gas_cur = np.max(np.abs(phi['g'])**2)
-phi['g'] *= np.sqrt(GAS_PEAK / gas_cur)
+gas_init *= np.sqrt(GAS_PEAK / np.max(np.abs(gas_init)**2))
+set_field(phi, gas_init)
 
 logger.info(f"Gas initial peak: {np.max(np.abs(phi['g'])**2):.4f}")
-
 plot_frame(psi_t, phi, "t=0.00  Initial state", f"{output_dir}/00_initial.png")
 
 # ==============================================
-# ФАЗА 4: ЭВОЛЮЦИЯ ТОЛЬКО ГАЗА (тор заморожен)
+# ФАЗА 4: ЭВОЛЮЦИЯ ГАЗА (тор заморожен)
 # ==============================================
-logger.info("PHASE 4: Gas dynamics in frozen torus potential + poloidal pump")
+# Уравнение Гросса-Питаевского:
+#   i*d_t(phi) = -0.5*Lap(phi) + (V_trap + V_tor + V_pol + V_nl)*phi
+# V_nl = g_gas*|phi|^2 обновляется явно перед каждым шагом —
+# Dedalus видит только линейный член V_nl*phi.
+logger.info("PHASE 4: Gas dynamics (GPE) in frozen torus + poloidal pump")
 
 problem_gas = d3.IVP([phi], namespace=locals())
 problem_gas.add_equation(
-    "dt(phi) - 0.5j*div(grad(phi)) = -1j*(V_trap + V_tor + V_pol)*phi"
+    "dt(phi) - 0.5j*div(grad(phi)) = -1j*(V_trap + V_tor + V_pol + V_nl)*phi"
 )
 
 solver_gas = problem_gas.build_solver(d3.RK222)
@@ -197,9 +195,14 @@ solver_gas.stop_sim_time = 10.0
 dt_gas = 5e-4
 
 frame_idx = 0
-save_every = 100   # каждые 0.05 единиц времени
+save_every = 100  # каждые 0.05 единиц времени
 
 while solver_gas.proceed:
+    # Обновляем нелинейный потенциал ПЕРЕД шагом
+    phi.change_scales(1)
+    V_nl.change_scales(1)
+    V_nl['g'] = g_gas * np.abs(phi['g'])**2
+
     solver_gas.step(dt_gas)
 
     phi.change_scales(1)

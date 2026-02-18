@@ -103,7 +103,7 @@ def main():
     
     parser.add_argument(
         '-i', '--input-dir',
-        default='smoke_2views',
+        default='frames_torus_v2',
         help='Директория с PNG-файлами (по умолчанию: frames_drag_test)'
     )
     
