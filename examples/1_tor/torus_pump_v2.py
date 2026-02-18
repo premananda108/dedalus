@@ -22,7 +22,7 @@ Lx, Ly, Lz = 24, 24, 24
 Nx, Ny, Nz = 32, 32, 32
 R_torus    = 5.0
 g_tor      = 5.0    # нелинейность тора (сильная — тор жёсткий)
-g_gas      = 0.0    # газ невзаимодействующий (не поглощается тором)
+g_gas      = 8.0    # самодействие газа — держит сгустки компактными
 omega_trap = 2.0
 DESIRED_PEAK = 1.0
 GAS_PEAK     = 0.5
@@ -180,11 +180,12 @@ phi.change_scales(1)
 # Сгустки газа внутри дырки тора (r < R_torus - 1.5 ≈ 3.5)
 # Расположены в плоскости z=0 и немного выше/ниже
 phi['g'] = (
-      1.0 * gauss3d( 2.0,  0.5,  0.0, sx=1.0, sy=1.0, sz=1.2)
-    + 0.9 * gauss3d(-1.5,  1.5,  0.0, sx=1.0, sy=1.0, sz=1.2)
-    + 0.8 * gauss3d( 0.5, -2.0,  0.0, sx=1.0, sy=1.0, sz=1.2)
-    + 0.7 * gauss3d(-1.0, -1.0,  2.0, sx=0.8, sy=0.8, sz=0.8)
-    + 0.7 * gauss3d( 1.5,  1.0, -2.0, sx=0.8, sy=0.8, sz=0.8)
+      1.0 * gauss3d( 2.0,  0.5,  0.0, sx=1.2, sy=1.2, sz=1.5)
+    + 1.0 * gauss3d(-2.0,  0.5,  0.2, sx=1.2, sy=1.2, sz=1.5)
+    + 1.0 * gauss3d(-1.5,  1.5,  0.0, sx=1.0, sy=1.0, sz=1.2)
+    + 1.0 * gauss3d( 0.5, -2.0,  0.0, sx=1.0, sy=1.0, sz=1.2)
+    + 0.9 * gauss3d(-1.0, -1.0,  2.0, sx=0.8, sy=0.8, sz=0.8)
+    + 0.9 * gauss3d( 1.5,  1.0, -2.0, sx=0.8, sy=0.8, sz=0.8)
 ).astype(np.complex128)
 
 # Нормируем газ
@@ -209,15 +210,15 @@ logger.info("PHASE 4: Gas dynamics in frozen torus potential + poloidal pump")
 
 problem_gas = d3.IVP([phi], namespace=locals())
 problem_gas.add_equation(
-    "dt(phi) - 0.5j*div(grad(phi)) = -1j*(V_trap + V_tor + V_pol)*phi"
+    "dt(phi) - 0.5j*div(grad(phi)) = -1j*(V_trap + V_tor + V_pol)*phi - 1j*g_gas*conj(phi)*phi*phi"
 )
 
 solver_gas = problem_gas.build_solver(d3.RK222)
-solver_gas.stop_sim_time = 10.0
-dt_gas = 5e-4
+solver_gas.stop_sim_time = 20.0   # дольше — больше времени наблюдать
+dt_gas = 2e-4                     # меньше шаг — устойчиво с нелинейностью
 
 frame_idx = 0
-save_every = 100   # каждые 0.05 единиц времени
+save_every = 200   # каждые 0.04 единиц времени
 
 while solver_gas.proceed:
     solver_gas.step(dt_gas)
