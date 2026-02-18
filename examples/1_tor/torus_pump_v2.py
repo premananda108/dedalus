@@ -12,19 +12,24 @@ import matplotlib.pyplot as plt
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-output_dir = 'examples/1_tor/frames_torus'
+output_dir = 'examples/1_tor/frames_torus_v2'
 os.makedirs(output_dir, exist_ok=True)
 
 # ==============================================
-# ПАРАМЕТРЫ — уменьшена сетка для скорости
+# ПАРАМЕТРЫ
 # ==============================================
 Lx, Ly, Lz = 24, 24, 24
-Nx, Ny, Nz = 32, 32, 32   # 32^3 — в 8 раз быстрее чем 64^3
+Nx, Ny, Nz = 32, 32, 32
 R_torus    = 5.0
-g          = 5.0
+g_tor      = 5.0    # нелинейность тора (сильная — тор жёсткий)
+g_gas      = 0.0    # газ невзаимодействующий (не поглощается тором)
 omega_trap = 2.0
 DESIRED_PEAK = 1.0
 GAS_PEAK     = 0.5
+
+# Скорость полоидального насоса
+# Положительное v_pol — газ идёт снизу вверх внутри дырки
+V_POL = 3.0
 
 # ==============================================
 # БАЗИС
@@ -36,52 +41,75 @@ xbasis = d3.ComplexFourier(coords['x'], size=Nx, bounds=(-Lx/2, Lx/2), dealias=3
 ybasis = d3.ComplexFourier(coords['y'], size=Ny, bounds=(-Ly/2, Ly/2), dealias=3/2)
 zbasis = d3.ComplexFourier(coords['z'], size=Nz, bounds=(-Lz/2, Lz/2), dealias=3/2)
 
-psi    = dist.Field(name='psi',    bases=(xbasis, ybasis, zbasis))
+# Два поля: тор (фиксированный) и газ (эволюционирует)
+psi_t  = dist.Field(name='psi_t',  bases=(xbasis, ybasis, zbasis))  # тор
+phi    = dist.Field(name='phi',    bases=(xbasis, ybasis, zbasis))  # газ
 V_trap = dist.Field(name='V_trap', bases=(xbasis, ybasis, zbasis))
+V_tor  = dist.Field(name='V_tor',  bases=(xbasis, ybasis, zbasis))  # потенциал от тора
+V_pol  = dist.Field(name='V_pol',  bases=(xbasis, ybasis, zbasis))  # полоидальный насос
 
 x, y, z = dist.local_grids(xbasis, ybasis, zbasis)
 r_cyl   = np.sqrt(x**2 + y**2)
-
-V_trap['g'] = 0.5 * omega_trap**2 * ((r_cyl - R_torus)**2 + z**2)
 
 x1d = x[:, 0, 0];  y1d = y[0, :, 0];  z1d = z[0, 0, :]
 iz0 = np.argmin(np.abs(z1d))
 iy0 = np.argmin(np.abs(y1d))
 
+V_trap['g'] = 0.5 * omega_trap**2 * ((r_cyl - R_torus)**2 + z**2)
+
 # ==============================================
 # УТИЛИТЫ
 # ==============================================
-def normalize(psi, target=DESIRED_PEAK):
-    psi.change_scales(1)
-    cur = np.max(np.abs(psi['g'])**2)
+def normalize(field, target=DESIRED_PEAK):
+    field.change_scales(1)
+    cur = np.max(np.abs(field['g'])**2)
     if cur > 1e-30:
-        psi['g'] *= np.sqrt(target / cur)
+        field['g'] *= np.sqrt(target / cur)
 
-def plot_xy(psi, label, fname, vmax=None):
-    """XY (сверху) + XZ (сбоку)"""
-    psi.change_scales(1)
-    dens = np.abs(psi['g'])**2
-    peak = float(np.max(dens))
-    if vmax is None:
-        vmax = peak
+def gauss3d(cx, cy, cz, sx=1.0, sy=1.0, sz=1.5):
+    return np.exp(-((x-cx)**2/(2*sx**2) +
+                    (y-cy)**2/(2*sy**2) +
+                    (z-cz)**2/(2*sz**2)))
 
-    dxy = dens[:, :, iz0]
-    dxz = dens[:, iy0, :]
+def plot_frame(psi_t, phi, label, fname, gas_vmax=None):
+    psi_t.change_scales(1); phi.change_scales(1)
+    dens_tor = np.abs(psi_t['g'])**2
+    dens_gas = np.abs(phi['g'])**2
+
+    if gas_vmax is None:
+        gas_vmax = float(np.max(dens_gas)) * 1.2 or GAS_PEAK
+
+    # XY срез
+    tor_xy = dens_tor[:, :, iz0]
+    gas_xy = dens_gas[:, :, iz0]
+    # XZ срез
+    tor_xz = dens_tor[:, iy0, :]
+    gas_xz = dens_gas[:, iy0, :]
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 6))
-    fig.suptitle(f"{label}   peak={peak:.3f}", fontsize=13)
+    fig.suptitle(label, fontsize=13)
 
-    im0 = axes[0].imshow(dxy.T, extent=[-Lx/2, Lx/2, -Ly/2, Ly/2],
-                          cmap='inferno', origin='lower', vmin=0, vmax=vmax)
-    axes[0].set_title("XY (top view)")
+    ext_xy = [-Lx/2, Lx/2, -Ly/2, Ly/2]
+    ext_xz = [-Lx/2, Lx/2, -Lz/2, Lz/2]
+
+    # XY: тор (красный канал) + газ (синий канал) — RGB наложение
+    def make_rgb(tor, gas, tor_vmax, gas_vmax):
+        r = np.clip(tor / tor_vmax, 0, 1)
+        b = np.clip(gas / gas_vmax, 0, 1)
+        g_ch = np.clip(gas / gas_vmax * 0.3, 0, 1)
+        return np.stack([r.T, g_ch.T, b.T], axis=-1)
+
+    tor_vmax = float(np.max(dens_tor)) or 1.0
+
+    rgb_xy = make_rgb(tor_xy, gas_xy, tor_vmax, gas_vmax)
+    axes[0].imshow(rgb_xy, extent=ext_xy, origin='lower')
+    axes[0].set_title("XY top view  (red=torus, blue=gas)")
     axes[0].set_xlabel("x"); axes[0].set_ylabel("y")
-    plt.colorbar(im0, ax=axes[0])
 
-    im1 = axes[1].imshow(dxz.T, extent=[-Lx/2, Lx/2, -Lz/2, Lz/2],
-                          cmap='inferno', origin='lower', vmin=0, vmax=vmax)
-    axes[1].set_title("XZ (side view)")
+    rgb_xz = make_rgb(tor_xz, gas_xz, tor_vmax, gas_vmax)
+    axes[1].imshow(rgb_xz, extent=ext_xz, origin='lower')
+    axes[1].set_title("XZ side view  (red=torus, blue=gas)")
     axes[1].set_xlabel("x"); axes[1].set_ylabel("z")
-    plt.colorbar(im1, ax=axes[1])
 
     plt.tight_layout()
     plt.savefig(fname, dpi=100)
@@ -89,114 +117,124 @@ def plot_xy(psi, label, fname, vmax=None):
     logger.info(f"Saved: {fname}")
 
 # ==============================================
-# НАЧАЛЬНОЕ УСЛОВИЕ
+# ФАЗА 1: РЕЛАКСАЦИЯ ТОРА
 # ==============================================
-psi.change_scales(1)
+logger.info("PHASE 1: Torus ground state")
+
+psi_t.change_scales(1)
 d_torus = np.sqrt((r_cyl - R_torus)**2 + z**2)
-psi['g'] = np.exp(-d_torus**2 / (2 * 1.5**2)).astype(np.complex128)
-normalize(psi)
+psi_t['g'] = np.exp(-d_torus**2 / (2 * 1.5**2)).astype(np.complex128)
+normalize(psi_t)
 
-# ==============================================
-# ФАЗА 1: МНИМОЕ ВРЕМЯ (быстрее — меньше шагов)
-# ==============================================
-logger.info("PHASE 1: Imaginary time relaxation (32^3 grid)")
-
-problem_relax = d3.IVP([psi], namespace=locals())
+problem_relax = d3.IVP([psi_t], namespace=locals())
 problem_relax.add_equation(
-    "dt(psi) = 0.5*div(grad(psi)) - V_trap*psi - g*conj(psi)*psi*psi"
+    "dt(psi_t) = 0.5*div(grad(psi_t)) - V_trap*psi_t - g_tor*conj(psi_t)*psi_t*psi_t"
 )
 
-solver_relax = problem_relax.build_solver(d3.RK222)
-solver_relax.stop_sim_time = 2.0   # меньше времени — достаточно для сходимости
-dt_relax = 2e-3                    # больший шаг — быстрее
+solver_r = problem_relax.build_solver(d3.RK222)
+solver_r.stop_sim_time = 2.0
+while solver_r.proceed:
+    solver_r.step(2e-3)
+    normalize(psi_t)
+    if not np.all(np.isfinite(psi_t['g'])):
+        logger.error("NaN in torus relaxation!"); break
 
-while solver_relax.proceed:
-    solver_relax.step(dt_relax)
-    normalize(psi)
-    if not np.all(np.isfinite(psi['g'])):
-        logger.error("NaN in relaxation!"); break
+normalize(psi_t)
 
-normalize(psi)
-plot_xy(psi, "GROUND STATE", f"{output_dir}/01_ground_state.png")
-logger.info("Phase 1 done.")
+# Сохраняем профиль тора — он больше НЕ МЕНЯЕТСЯ
+psi_t.change_scales(1)
+torus_profile = psi_t['g'].copy()  # замороженный тор
+logger.info(f"Torus ground state: peak={np.max(np.abs(torus_profile)**2):.4f}")
 
 # ==============================================
-# ФАЗА 2: ДОБАВЛЯЕМ ГАЗ ВНУТРИ ДЫРКИ ТОРА
+# ФАЗА 2: ПОТЕНЦИАЛ ОТ ТОРА + ПОЛОИДАЛЬНЫЙ НАСОС
 # ==============================================
-logger.info("PHASE 2: Adding gas blobs INSIDE torus hole")
+logger.info("PHASE 2: Building torus potential + poloidal pump")
 
-psi.change_scales(1)
-psi_torus = psi['g'].copy()
-d_torus   = np.sqrt((r_cyl - R_torus)**2 + z**2)
+# Потенциал от тора: газ отталкивается от плотного тора
+# V_tor = g_tor * |psi_torus|^2  (среднеполевое отталкивание)
+V_tor['g'] = g_tor * np.abs(torus_profile)**2
+
+# Полоидальный насос: скорость вдоль полоидального направления
+# В поперечном сечении тора (r-R, z) создаём вращение по часовой стрелке
+# Это гонит газ: снизу внутрь дырки → вверх → наружу → вниз → снова внутрь
+d_torus_2d = np.sqrt((r_cyl - R_torus)**2 + z**2)
+
+# Сила насоса: действует только внутри трубки тора и вблизи неё
+pump_mask = np.exp(-0.5 * d_torus_2d**2 / 3.0**2)
+
+# Полоидальный угол в поперечном сечении тора
 theta_pol = np.arctan2(z, r_cyl - R_torus)
 
-# -------------------------------------------------------
-# 3 сгустка газа внутри дырки (r < R_torus - 1)
-# расположены несимметрично — интереснее наблюдать движение
-# -------------------------------------------------------
-def gauss3d(cx, cy, cz, sx=1.0, sy=1.0, sz=1.5):
-    return np.exp(-((x-cx)**2/(2*sx**2) + (y-cy)**2/(2*sy**2) + (z-cz)**2/(2*sz**2)))
+# Потенциал насоса: линейный по theta_pol → создаёт полоидальный ток
+# V_pol = -V_POL * theta_pol * mask → grad(V_pol) направлен вдоль theta
+V_pol['g'] = -V_POL * theta_pol * pump_mask
 
-# Сгустки внутри дырки — r ~ 1..3, z ~ 0
-psi_gas = (
-      1.0 * gauss3d( 2.0,  0.5, 0.0, sx=1.0, sy=1.0, sz=1.5)
-    + 0.8 * gauss3d(-1.5,  2.0, 0.0, sx=1.0, sy=1.0, sz=1.5)
-    + 0.9 * gauss3d( 0.5, -2.5, 0.0, sx=1.0, sy=1.0, sz=1.5)
-    + 1.0 * gauss3d( 0.0,  0.0, 0.0, sx=1.0, sy=1.0, sz=1.5)  # центр
-    + 0.7 * gauss3d(-2.0, -1.0, 2.0, sx=1.0, sy=1.0, sz=1.0)  # выше
+# ==============================================
+# ФАЗА 3: НАЧАЛЬНОЕ УСЛОВИЕ ДЛЯ ГАЗА
+# ==============================================
+logger.info("PHASE 3: Setting up gas initial condition")
+
+phi.change_scales(1)
+
+# Сгустки газа внутри дырки тора (r < R_torus - 1.5 ≈ 3.5)
+# Расположены в плоскости z=0 и немного выше/ниже
+phi['g'] = (
+      1.0 * gauss3d( 2.0,  0.5,  0.0, sx=1.0, sy=1.0, sz=1.2)
+    + 0.9 * gauss3d(-1.5,  1.5,  0.0, sx=1.0, sy=1.0, sz=1.2)
+    + 0.8 * gauss3d( 0.5, -2.0,  0.0, sx=1.0, sy=1.0, sz=1.2)
+    + 0.7 * gauss3d(-1.0, -1.0,  2.0, sx=0.8, sy=0.8, sz=0.8)
+    + 0.7 * gauss3d( 1.5,  1.0, -2.0, sx=0.8, sy=0.8, sz=0.8)
 ).astype(np.complex128)
 
-# Нормируем газ к GAS_PEAK
-gas_peak_cur = np.max(np.abs(psi_gas)**2)
-psi_gas *= np.sqrt(GAS_PEAK / gas_peak_cur)
+# Нормируем газ
+gas_cur = np.max(np.abs(phi['g'])**2)
+phi['g'] *= np.sqrt(GAS_PEAK / gas_cur)
 
-logger.info(f"Gas: 3 blobs inside hole, peak={np.max(np.abs(psi_gas)**2):.4f}")
+logger.info(f"Gas initial peak: {np.max(np.abs(phi['g'])**2):.4f}")
 
-# -------------------------------------------------------
-# ПОЛОИДАЛЬНАЯ ФАЗА (насос, m=1)
-# -------------------------------------------------------
-m_pump     = 1
-phase_mask = np.exp(-0.5 * d_torus**2 / 2.0**2)
-psi['g']   = (psi_torus + psi_gas) * np.exp(1j * m_pump * theta_pol * phase_mask)
-
-# Сохраняем начальное состояние с газом
-# vmax = GAS_PEAK*1.5 — тор насыщен белым, газ виден ярко
-plot_xy(psi, "t=0.00  Torus + Gas in hole",
-        f"{output_dir}/02_initial_with_gas.png",
-        vmax=GAS_PEAK * 1.5)
+# Начальный кадр
+plot_frame(psi_t, phi, "t=0.00  Initial state", f"{output_dir}/00_initial.png")
 
 # ==============================================
-# ФАЗА 3: РЕАЛЬНАЯ ДИНАМИКА
+# ФАЗА 4: ЭВОЛЮЦИЯ ТОЛЬКО ГАЗА (тор заморожен)
 # ==============================================
-logger.info("PHASE 3: Real-time dynamics — watching gas get entrained!")
+# Уравнение для газа:
+#   i*d_t(phi) = -0.5*Lap(phi) + (V_trap + V_tor + V_pol)*phi
+#
+# V_trap — ловушка (газ не улетает)
+# V_tor  — отталкивание от тора (газ не проникает в тор)
+# V_pol  — полоидальный насос (гонит газ через дырку)
+logger.info("PHASE 4: Gas dynamics in frozen torus potential + poloidal pump")
 
-problem_real = d3.IVP([psi], namespace=locals())
-problem_real.add_equation(
-    "dt(psi) - 0.5j*div(grad(psi)) = -1j*V_trap*psi - 1j*g*conj(psi)*psi*psi"
+problem_gas = d3.IVP([phi], namespace=locals())
+problem_gas.add_equation(
+    "dt(phi) - 0.5j*div(grad(phi)) = -1j*(V_trap + V_tor + V_pol)*phi"
 )
 
-solver_real = problem_real.build_solver(d3.RK222)
-solver_real.stop_sim_time = 8.0   # достаточно долго чтобы увидеть затягивание
-dt_real = 5e-4                    # шаг покрупнее — быстрее
+solver_gas = problem_gas.build_solver(d3.RK222)
+solver_gas.stop_sim_time = 10.0
+dt_gas = 5e-4
 
-# Сохраняем часто — каждые 100 шагов (dt=5e-4 → каждые 0.05 единиц времени)
 frame_idx = 0
-save_every = 100
+save_every = 100   # каждые 0.05 единиц времени
 
-while solver_real.proceed:
-    solver_real.step(dt_real)
+while solver_gas.proceed:
+    solver_gas.step(dt_gas)
 
-    psi.change_scales(1)
-    if not np.all(np.isfinite(psi['g'])):
-        logger.error(f"NaN at t={solver_real.sim_time:.4f}"); break
+    phi.change_scales(1)
+    if not np.all(np.isfinite(phi['g'])):
+        logger.error(f"NaN at t={solver_gas.sim_time:.4f}"); break
 
-    if solver_real.iteration % save_every == 0:
-        t = solver_real.sim_time
-        logger.info(f"  [Real] t={t:.3f}")
-        plot_xy(psi, f"t={t:.2f}",
-                f"{output_dir}/frame_{frame_idx:04d}.png",
-                vmax=GAS_PEAK * 1.5)
+    if solver_gas.iteration % save_every == 0:
+        t = solver_gas.sim_time
+        gas_peak = float(np.max(np.abs(phi['g'])**2))
+        logger.info(f"  t={t:.3f}  gas_peak={gas_peak:.4f}")
+        plot_frame(psi_t, phi,
+                   f"t={t:.2f}  gas_peak={gas_peak:.3f}",
+                   f"{output_dir}/frame_{frame_idx:04d}.png",
+                   gas_vmax=GAS_PEAK)
         frame_idx += 1
 
 logger.info(f"Done! {frame_idx} frames in {output_dir}/")
-logger.info("Tip: make video with:  ffmpeg -r 20 -i frames_torus/frame_%04d.png -vcodec libx264 torus.mp4")
+logger.info("Make video: ffmpeg -r 20 -i frames_torus/frame_%04d.png -vcodec libx264 torus.mp4")
