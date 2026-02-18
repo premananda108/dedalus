@@ -1,250 +1,225 @@
 import os
-# Ограничиваем потоки для скорости
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_MAX_THREADS"] = "1"
 
 import numpy as np
 import dedalus.public as d3
 import logging
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-output_dir = 'examples/1_tor/frames_pump_v2'
+output_dir = 'frames_torus'
 os.makedirs(output_dir, exist_ok=True)
 
 # ==============================================
 # ПАРАМЕТРЫ
 # ==============================================
 Lx, Ly, Lz = 24, 24, 24
-Nx, Ny, Nz = 64, 64, 64
+Nx, Ny, Nz = 32, 32, 32
 R_torus = 5.0
-g = 30.0
-omega_trap = 3.0
-DESIRED_PEAK = 2.0  # Желаемая пиковая плотность |psi|^2 тора
+g = 5.0
+omega_trap = 2.0
+DESIRED_PEAK = 1.0
+GAS_FRACTION = 0.30   # газ = 30% от пика тора (виден на линейной шкале)
 
-# Базис
+# ==============================================
+# БАЗИС
+# ==============================================
 coords = d3.CartesianCoordinates('x', 'y', 'z')
-dist = d3.Distributor(coords, dtype=np.complex128)
+dist   = d3.Distributor(coords, dtype=np.complex128)
+
 xbasis = d3.ComplexFourier(coords['x'], size=Nx, bounds=(-Lx/2, Lx/2), dealias=3/2)
 ybasis = d3.ComplexFourier(coords['y'], size=Ny, bounds=(-Ly/2, Ly/2), dealias=3/2)
 zbasis = d3.ComplexFourier(coords['z'], size=Nz, bounds=(-Lz/2, Lz/2), dealias=3/2)
 
-psi = dist.Field(name='psi', bases=(xbasis, ybasis, zbasis))
-V_trap = dist.Field(name='V', bases=(xbasis, ybasis, zbasis))
+psi    = dist.Field(name='psi',    bases=(xbasis, ybasis, zbasis))
+V_trap = dist.Field(name='V_trap', bases=(xbasis, ybasis, zbasis))
 
 x, y, z = dist.local_grids(xbasis, ybasis, zbasis)
-r_cyl = np.sqrt(x**2 + y**2)
+r_cyl   = np.sqrt(x**2 + y**2)
 
-# Потенциал ловушки
-V_trap['g'] = 0.5 * (omega_trap**2) * ((r_cyl - R_torus)**2 + z**2)
+V_trap['g'] = 0.5 * omega_trap**2 * ((r_cyl - R_torus)**2 + z**2)
 
-def rescale_to_peak(field, target_peak):
-    """Масштабировать psi так, чтобы max(|psi|^2) = target_peak"""
-    field.change_scales(1)
-    current_peak = np.max(np.abs(field['g'])**2)
-    if current_peak > 1e-30:
-        field['g'] *= np.sqrt(target_peak / current_peak)
-    logger.info(f"  Rescaled: peak |psi|^2 was {current_peak:.6f}, now {target_peak:.2f}")
+# Координаты осей (для срезов)
+x1d = x[:, 0, 0]
+y1d = y[0, :, 0]
+z1d = z[0, 0, :]
+iz0 = np.argmin(np.abs(z1d))
+iy0 = np.argmin(np.abs(y1d))
+
+logger.info(f"Midplane slices: z={z1d[iz0]:.3f} (iz0={iz0}), y={y1d[iy0]:.3f} (iy0={iy0})")
 
 # ==============================================
-# ФАЗА 1: МНИМОЕ ВРЕМЯ — СТАБИЛИЗАЦИЯ ТОРА
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==============================================
-logger.info("=" * 50)
-logger.info("PHASE 1: Imaginary time relaxation")
-logger.info("=" * 50)
+def normalize(psi, target=DESIRED_PEAK):
+    psi.change_scales(1)
+    cur = np.max(np.abs(psi['g'])**2)
+    if cur > 1e-30:
+        psi['g'] *= np.sqrt(target / cur)
 
-# Начальное приближение
+def plot_state(psi, label, fname):
+    psi.change_scales(1)
+    dens = np.abs(psi['g'])**2
+    peak = float(np.max(dens))
+    vmax = peak if peak > 0 else 1.0
+
+    dxy = dens[:, :, iz0]
+    dxz = dens[:, iy0, :]
+
+    vmin_log = max(vmax * 1e-4, 1e-10)
+    dxy_log  = np.clip(dxy, vmin_log, None)
+    dxz_log  = np.clip(dxz, vmin_log, None)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    fig.suptitle(f"{label}   peak={peak:.4f}", fontsize=14)
+
+    ext_xy = [-Lx/2, Lx/2, -Ly/2, Ly/2]
+    ext_xz = [-Lx/2, Lx/2, -Lz/2, Lz/2]
+
+    # Верхний ряд: линейная шкала
+    im = axes[0,0].imshow(dxy.T, extent=ext_xy, cmap='inferno',
+                           origin='lower', vmin=0, vmax=vmax)
+    axes[0,0].set_title("XY  linear"); axes[0,0].set_xlabel("x"); axes[0,0].set_ylabel("y")
+    plt.colorbar(im, ax=axes[0,0])
+
+    im = axes[0,1].imshow(dxz.T, extent=ext_xz, cmap='inferno',
+                           origin='lower', vmin=0, vmax=vmax)
+    axes[0,1].set_title("XZ  linear"); axes[0,1].set_xlabel("x"); axes[0,1].set_ylabel("z")
+    plt.colorbar(im, ax=axes[0,1])
+
+    # Нижний ряд: логарифмическая шкала (газ виден)
+    norm = LogNorm(vmin=vmin_log, vmax=vmax)
+
+    im = axes[1,0].imshow(dxy_log.T, extent=ext_xy, cmap='inferno',
+                           origin='lower', norm=norm)
+    axes[1,0].set_title("XY  LOG (gas visible)"); axes[1,0].set_xlabel("x"); axes[1,0].set_ylabel("y")
+    plt.colorbar(im, ax=axes[1,0])
+
+    im = axes[1,1].imshow(dxz_log.T, extent=ext_xz, cmap='inferno',
+                           origin='lower', norm=norm)
+    axes[1,1].set_title("XZ  LOG (gas visible)"); axes[1,1].set_xlabel("x"); axes[1,1].set_ylabel("z")
+    plt.colorbar(im, ax=axes[1,1])
+
+    plt.tight_layout()
+    plt.savefig(fname, dpi=100)
+    plt.close()
+    logger.info(f"Saved: {fname}  (peak={peak:.4e})")
+
+# ==============================================
+# НАЧАЛЬНОЕ УСЛОВИЕ
+# ==============================================
 psi.change_scales(1)
-psi['g'] = np.sqrt(DESIRED_PEAK) * np.exp(-0.5 * ((r_cyl - R_torus)**2 + z**2))
+d_torus = np.sqrt((r_cyl - R_torus)**2 + z**2)
+psi['g'] = np.exp(-d_torus**2 / (2 * 1.5**2)).astype(np.complex128)
+normalize(psi)
+plot_state(psi, "INITIAL", f"{output_dir}/00_initial.png")
 
-# GPE в мнимом времени
+# ==============================================
+# ФАЗА 1: МНИМОЕ ВРЕМЯ
+# ==============================================
+logger.info("PHASE 1: Imaginary time relaxation")
+
 problem_relax = d3.IVP([psi], namespace=locals())
 problem_relax.add_equation(
-    "dt(psi) - 0.5*div(grad(psi)) = -V_trap*psi - g*psi*conj(psi)*psi"
+    "dt(psi) = 0.5*div(grad(psi)) - V_trap*psi - g*conj(psi)*psi*psi"
 )
 
 solver_relax = problem_relax.build_solver(d3.RK222)
-solver_relax.stop_sim_time = 2.0
-dt_relax = 5e-3
+solver_relax.stop_sim_time = 3.0
+dt_relax = 1e-3
 
-frame_relax = 0
+frame_r = 0
 while solver_relax.proceed:
     solver_relax.step(dt_relax)
+    normalize(psi)
 
-    # Ренормализация: поддерживаем пиковую плотность
-    if solver_relax.iteration % 10 == 0:
-        rescale_to_peak(psi, DESIRED_PEAK)
+    if not np.all(np.isfinite(psi['g'])):
+        logger.error(f"NaN at relax iter={solver_relax.iteration}"); break
 
-    # Визуализация
-    if solver_relax.iteration % 100 == 0:
+    if solver_relax.iteration % 500 == 0:
         t = solver_relax.sim_time
-        psi.change_scales(1)
-        dens = np.abs(psi['g'])**2
-        dens_xy = dens[:, :, Nz//2]
-        dens_xz = dens[:, Ny//2, :]
-        peak = np.max(dens)
-        logger.info(f"  Relax t={t:.2f}, peak density={peak:.4f}")
+        logger.info(f"  [Relax] tau={t:.3f}")
+        plot_state(psi, f"Relax tau={t:.2f}", f"{output_dir}/relax_{frame_r:04d}.png")
+        frame_r += 1
 
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-        axes[0].imshow(dens_xy.T, extent=[-Lx/2, Lx/2, -Ly/2, Ly/2],
-                        cmap='inferno', origin='lower', vmin=0, vmax=DESIRED_PEAK)
-        axes[0].set_title(f"Relax XY t={t:.2f}, peak={peak:.3f}")
-        axes[0].set_xlabel("x"); axes[0].set_ylabel("y")
-
-        axes[1].imshow(dens_xz.T, extent=[-Lx/2, Lx/2, -Lz/2, Lz/2],
-                        cmap='inferno', origin='lower', vmin=0, vmax=DESIRED_PEAK)
-        axes[1].set_title(f"Relax XZ t={t:.2f}")
-        axes[1].set_xlabel("x"); axes[1].set_ylabel("z")
-
-        plt.tight_layout()
-        plt.savefig(f"{output_dir}/frame_relax_{frame_relax:04d}.png")
-        plt.close()
-        frame_relax += 1
-
-rescale_to_peak(psi, DESIRED_PEAK)
-logger.info("Phase 1 done: torus stabilized.")
+normalize(psi)
+plot_state(psi, "GROUND STATE", f"{output_dir}/01_ground_state.png")
+logger.info("Phase 1 done.")
 
 # ==============================================
-# ФАЗА 2: ДОБАВЛЕНИЕ ГАЗА + ПОЛОИДАЛЬНАЯ ФАЗА
+# ФАЗА 2: ГАЗ + ПОЛОИДАЛЬНАЯ ФАЗА
 # ==============================================
-logger.info("=" * 50)
-logger.info("PHASE 2: Adding gas + poloidal pump phase")
-logger.info("=" * 50)
+logger.info("PHASE 2: Adding gas + poloidal phase")
 
 psi.change_scales(1)
 psi_torus = psi['g'].copy()
 
-# Расстояние от трубки тора
-d_torus = np.sqrt((r_cyl - R_torus)**2 + z**2)
+d_torus   = np.sqrt((r_cyl - R_torus)**2 + z**2)
+theta_pol = np.arctan2(z, r_cyl - R_torus)
 
-# Газ: 10% от пиковой плотности тора, с модуляциями для визуализации
-gas_density_fraction = 0.10
-gas_amp = np.sqrt(DESIRED_PEAK * gas_density_fraction)
+# --- Газ ---
+# Амплитуда: sqrt(GAS_FRACTION) — чтобы |psi_gas|^2 = GAS_FRACTION
+gas_amp = np.sqrt(GAS_FRACTION)
 
-gas_modulation = (
+# Равномерный фон с мягкими волнами для наглядности
+gas_bg = gas_amp * (
     1.0
-    + 0.4 * np.sin(2 * np.pi * z / Lz * 3)
-    + 0.3 * np.cos(2 * np.pi * x / Lx * 2)
-    + 0.2 * np.sin(2 * np.pi * y / Ly * 2)
+    + 0.2 * np.sin(2 * np.pi * x / (Lx / 3))
+    + 0.2 * np.cos(2 * np.pi * y / (Ly / 3))
+    + 0.15 * np.sin(2 * np.pi * z / (Lz / 4))
 )
 
-# Маска: газ вне тела тора (плавный переход)
-gas_mask = np.clip((d_torus - 1.5) / 2.0, 0.0, 1.0)
+# Маска: газ присутствует вне тела тора (плавный переход)
+gas_mask   = 1.0 - np.exp(-0.5 * d_torus**2 / 1.5**2)
+psi_gas    = gas_bg * gas_mask
 
-psi_gas = gas_amp * gas_modulation * gas_mask
-psi['g'] = psi_torus + psi_gas
+# --- Полоидальная фаза ---
+m_pump      = 1
+phase_mask  = np.exp(-0.5 * d_torus**2 / 2.0**2)
+phase_field = np.exp(1j * m_pump * theta_pol * phase_mask)
 
-# Полоидальная фаза (насос)
-theta_pol = np.arctan2(z, r_cyl - R_torus)
-m_pump = 1
+# Суперпозиция тор + газ, с фазой
+psi['g'] = (psi_torus + psi_gas) * phase_field
 
-# Фаза сильная на торе, затухает вдали
-phase_mask = np.exp(-0.5 * d_torus**2 / 4.0**2)
-phase_field = m_pump * theta_pol * phase_mask
-psi['g'] *= np.exp(1j * phase_field)
+# Нормируем так, чтобы пик тора ≈ 1 (не меняем абсолютный масштаб слишком сильно)
+normalize(psi)
 
-# Логируем реальные значения
-psi.change_scales(1)
-dens = np.abs(psi['g'])**2
-logger.info(f"  Peak density after Phase 2: {np.max(dens):.4f}")
-logger.info(f"  Mean density: {np.mean(dens):.6f}")
-logger.info(f"  Gas amplitude: {gas_amp:.4f} (|psi_gas|^2 ~ {gas_amp**2:.4f})")
-
-# Сохраняем начальное состояние
-dens_xy = dens[:, :, Nz//2]
-dens_xz = dens[:, Ny//2, :]
-phase_xz = np.angle(psi['g'][:, Ny//2, :])
-
-fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
-im0 = axes[0].imshow(dens_xy.T, extent=[-Lx/2, Lx/2, -Ly/2, Ly/2],
-                      cmap='inferno', origin='lower', vmin=0, vmax=DESIRED_PEAK)
-axes[0].set_title("Initial: Density XY (top)")
-axes[0].set_xlabel("x"); axes[0].set_ylabel("y")
-plt.colorbar(im0, ax=axes[0], fraction=0.046)
-
-# Боковой вид: vmax низкий, чтобы видеть газ
-side_vmax = DESIRED_PEAK * 0.15
-im1 = axes[1].imshow(dens_xz.T, extent=[-Lx/2, Lx/2, -Lz/2, Lz/2],
-                      cmap='inferno', origin='lower', vmin=0, vmax=side_vmax)
-axes[1].set_title(f"Initial: Density XZ (side, vmax={side_vmax:.2f})")
-axes[1].set_xlabel("x"); axes[1].set_ylabel("z")
-plt.colorbar(im1, ax=axes[1], fraction=0.046)
-
-im2 = axes[2].imshow(phase_xz.T, extent=[-Lx/2, Lx/2, -Lz/2, Lz/2],
-                      cmap='hsv', origin='lower')
-axes[2].set_title("Initial: Phase XZ (poloidal winding)")
-axes[2].set_xlabel("x"); axes[2].set_ylabel("z")
-plt.colorbar(im2, ax=axes[2], fraction=0.046)
-
-plt.tight_layout()
-plt.savefig(f"{output_dir}/initial_state.png")
-plt.close()
-logger.info("  Initial state saved.")
+logger.info(f"Gas density fraction: {GAS_FRACTION:.2f}")
+logger.info(f"Gas amplitude: {gas_amp:.4f}")
+plot_state(psi, "Torus + Gas + Phase", f"{output_dir}/02_torus_gas_phase.png")
 
 # ==============================================
-# ФАЗА 3: РЕАЛЬНАЯ ЭВОЛЮЦИЯ
+# ФАЗА 3: РЕАЛЬНАЯ ДИНАМИКА
 # ==============================================
-logger.info("=" * 50)
-logger.info("PHASE 3: Real-time dynamics")
-logger.info("=" * 50)
+logger.info("PHASE 3: Real-time GPE dynamics")
 
 problem_real = d3.IVP([psi], namespace=locals())
 problem_real.add_equation(
-    "dt(psi) - 0.5*1j*div(grad(psi)) = -1j*V_trap*psi - 1j*g*psi*conj(psi)*psi"
+    "dt(psi) - 0.5j*div(grad(psi)) = -1j*V_trap*psi - 1j*g*conj(psi)*psi*psi"
 )
 
 solver_real = problem_real.build_solver(d3.RK222)
 solver_real.stop_sim_time = 5.0
-dt_real = 1e-3
+dt_real = 2e-4
 
 frame_idx = 0
-
 while solver_real.proceed:
     solver_real.step(dt_real)
 
-    if solver_real.iteration % 100 == 0:
+    psi.change_scales(1)
+    if not np.all(np.isfinite(psi['g'])):
+        logger.error(f"NaN at real t={solver_real.sim_time:.4f}"); break
+
+    if solver_real.iteration % 500 == 0:
         t = solver_real.sim_time
-        psi.change_scales(1)
-        dens = np.abs(psi['g'])**2
-
-        peak = np.max(dens)
-        dens_xy = dens[:, :, Nz//2]
-        dens_xz = dens[:, Ny//2, :]
-
-        logger.info(f"  t={t:.3f}, peak={peak:.4f}")
-
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-        # Вид сверху
-        im1 = axes[0].imshow(dens_xy.T, extent=[-Lx/2, Lx/2, -Ly/2, Ly/2],
-                              cmap='inferno', origin='lower',
-                              vmin=0, vmax=DESIRED_PEAK)
-        axes[0].set_title(f"Top View (XY)  t={t:.2f}  peak={peak:.2f}")
-        axes[0].set_xlabel("x"); axes[0].set_ylabel("y")
-        plt.colorbar(im1, ax=axes[0], fraction=0.046)
-
-        # Вид сбоку — vmax = 15% от пика, чтобы видеть газ
-        side_vmax = DESIRED_PEAK * 0.15
-        im2 = axes[1].imshow(dens_xz.T, extent=[-Lx/2, Lx/2, -Lz/2, Lz/2],
-                              cmap='inferno', origin='lower',
-                              vmin=0, vmax=side_vmax)
-        axes[1].set_title(f"Side View (XZ)  t={t:.2f}")
-        axes[1].set_xlabel("x"); axes[1].set_ylabel("z")
-        plt.colorbar(im2, ax=axes[1], fraction=0.046)
-
-        # Стрелка потока
-        axes[1].annotate("", xy=(0, -4), xytext=(0, 4),
-                          arrowprops=dict(arrowstyle="->", color='cyan',
-                                         lw=2, alpha=0.7))
-
-        plt.tight_layout()
-        plt.savefig(f"{output_dir}/frame_{frame_idx:04d}.png")
-        plt.close()
+        logger.info(f"  [Real] t={t:.3f}")
+        plot_state(psi, f"Real t={t:.2f}", f"{output_dir}/frame_{frame_idx:04d}.png")
         frame_idx += 1
 
-logger.info("DONE! Frames saved to: " + output_dir)
+logger.info(f"Done! {frame_idx} frames in {output_dir}/")
