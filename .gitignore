@@ -8,6 +8,9 @@
 *.so
 *.o
 *.h5
+*.pvd
+*.vti
+*.xdmf
 .ipynb_checkpoints/
 .vscode
 .DS_Store

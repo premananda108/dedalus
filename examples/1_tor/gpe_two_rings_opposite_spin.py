@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 output_dir = 'examples/1_tor/frames_gpe_opposite_spin'
 os.makedirs(output_dir, exist_ok=True)
 
+snap_dir = 'examples/1_tor/snapshots_gpe_opposite_spin'
+
 # Domain
 Lx, Ly, Lz = 24, 24, 24
 Nx, Ny, Nz = 48, 48, 48 
@@ -78,9 +80,22 @@ problem.add_equation("dt(psi) - 0.5*1j*div(grad(psi)) = -1j*V_trap*psi - 1j*g*ps
 solver = problem.build_solver(d3.RK222)
 solver.stop_sim_time = 10.0
 
+# ==========================================
+# 4. Диагностические поля
+# ==========================================
+density = psi * d3.conj(psi)   # |ψ|²  (плотность)
+
+# ── Запись снапшотов в HDF5 (как в tornado_3d.py) ──
+snapshots = solver.evaluator.add_file_handler(
+    snap_dir, sim_dt=0.04, max_writes=500
+)
+snapshots.add_task(density.real, name='density')       # |ψ|²
+snapshots.add_task(psi.real,     name='psi_real')      # Re(ψ)
+snapshots.add_task(psi.imag,     name='psi_imag')      # Im(ψ)
+
 logger.info("Starting GPE Collision (Opposite Spins)...")
 frame_idx = 0
-dt = 2e-3 
+dt = 2e-3
 
 while solver.proceed:
     solver.step(dt)
