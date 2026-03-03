@@ -79,7 +79,7 @@ r_Q   = 0.45  # горизонтальный размер источника
 
 # ── Интегратор по времени ──────────────────────────────
 timestepper   = d3.RK222   # 2-й порядок IMEX-RK (неявная диффузия)
-stop_sim_time = 2.5       # конечное время симуляции
+stop_sim_time = 1.5       # конечное время симуляции
 max_timestep  = 5e-3       # верхняя граница шага dt (CFL ограничивает)
 
 dtype = np.float64
@@ -194,69 +194,69 @@ speed = np.sqrt(u @ u)               # |u| — модуль скорости
 wmag  = np.sqrt(omega @ omega)        # |ω| — модуль завихрённости
 
 # ═══════════════════════════════════════════════════════
-# §7. ГЛАВНЫЙ ЦИКЛ ИНТЕГРИРОВАНИЯ
-# (FileHandler, CFL и flow — только при запуске, не при импорте)
+# §7. ВИЗУАЛИЗАЦИЯ РЕЗУЛЬТАТОВ (запускать отдельно)
 # ═══════════════════════════════════════════════════════
-if __name__ == '__main__':
-    # ── Запись снапшотов каждые 0.05 единиц времени ────
-    snapshots = solver.evaluator.add_file_handler(
-        "snapshots_tornado", sim_dt=0.05, max_writes=400
-    )
-    snapshots.add_task(speed,  name="speed")
-    snapshots.add_task(wmag,   name="vorticity_mag")
-    snapshots.add_task(b,      name="buoyancy")
-    snapshots.add_task(p,      name="pressure")
-    snapshots.add_task(u,      name="velocity")   # полный 3D вектор
+def visualize(snap_dir="snapshots_tornado", frame=0, nz_slice=None):
+    """
+    Строит 4 панели для заданного снапшота:
+      (a) |u| в плоскости z=const (горизонтальный срез)
+      (b) |ω| в том же срезе
+      (c) b   в том же срезе
+      (d) p   в вертикальном срезе y=0 (XZ-плоскость)
 
-    # ── CFL: адаптивный шаг ────────────────────────────
-    # dt = safety · Δx / max|u|   (обеспечивает устойчивость)
-    CFL = d3.CFL(
-        solver,
-        initial_dt  = max_timestep,
-        cadence     = 10,
-        safety      = 0.3,
-        threshold   = 0.1,
-        max_change  = 1.5,
-        min_change  = 0.5,
-        max_dt      = max_timestep,
-    )
-    CFL.add_velocity(u)
+    Использование:
+      from tornado_3d import visualize
+      visualize(frame=10)
+    """
+    import h5py
+    import matplotlib.pyplot as plt
+    import glob, os
 
-    # ── Мониторинг в лог ───────────────────────────────
-    flow = d3.GlobalFlowProperty(solver, cadence=10)
-    flow.add_property(speed, name='speed')
-    flow.add_property(wmag,  name='omega')
-    flow.add_property(b,     name='buoyancy')
+    files = sorted(glob.glob(os.path.join(snap_dir, "*.h5")))
+    if not files:
+        print(f"Нет .h5 файлов в {snap_dir}/")
+        return
 
-    try:
-        logger.info("══════════════════════════════════════")
-        logger.info(" Запуск симуляции смерча (Dedalus v3) ")
-        logger.info(f" Re={Re:.0e}, Pr={Pr}, Γ={Gamma}, r_c={r_c}")
-        logger.info(f" Nx=Ny=Nz={Nx},  T_max={stop_sim_time}")
-        logger.info("══════════════════════════════════════")
-        while solver.proceed:
-            dt = CFL.compute_timestep()
-            solver.step(dt)
-            if (solver.iteration - 1) % 20 == 0:
-                logger.info(
-                    f"it={solver.iteration:6d} | "
-                    f"t={solver.sim_time:8.4f} | "
-                    f"dt={dt:8.2e} | "
-                    f"max|u|={flow.max('speed'):7.3f} | "
-                    f"max|ω|={flow.max('omega'):7.3f} | "
-                    f"max b={flow.max('buoyancy'):7.3f}"
-                )
-    except Exception:
-        logger.exception("Ошибка в главном цикле — завершение.")
-        raise
-    finally:
-        solver.log_stats()
+    with h5py.File(files[0], 'r') as f:
+        times  = f['scales/sim_time'][:]
+        speed  = f['tasks/speed'][frame, :, :, :]      # (Nx,Ny,Nz)
+        wmag   = f['tasks/vorticity_mag'][frame, :, :, :]
+        buoy   = f['tasks/buoyancy'][frame, :, :, :]
+        pres   = f['tasks/pressure'][frame, :, :, :]
 
-    export_vtk()
+    Nz = speed.shape[2]
+    iz  = Nz // 2 if nz_slice is None else nz_slice   # горизонт. срез
+    iy  = speed.shape[1] // 2                           # вертик. срез
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle(f"Смерч  |  t = {times[frame]:.2f}", fontsize=14, fontweight='bold')
+
+    kw = dict(origin='lower', cmap='hot', aspect='equal')
+    im0 = axes[0,0].imshow(speed[:,:,iz].T, **kw)
+    axes[0,0].set_title("|u| — скорость (z-срез)")
+    plt.colorbar(im0, ax=axes[0,0], label='|u|')
+
+    im1 = axes[0,1].imshow(wmag[:,:,iz].T, **{**kw, 'cmap':'plasma'})
+    axes[0,1].set_title("|ω| — завихрённость (z-срез)")
+    plt.colorbar(im1, ax=axes[0,1], label='|ω|')
+
+    im2 = axes[1,0].imshow(buoy[:,:,iz].T, **{**kw, 'cmap':'RdYlBu_r'})
+    axes[1,0].set_title("b — плавучесть / тепло (z-срез)")
+    plt.colorbar(im2, ax=axes[1,0], label='b')
+
+    im3 = axes[1,1].imshow(pres[:,iy,:].T, **{**kw, 'cmap':'coolwarm'})
+    axes[1,1].set_title("p — давление (y=0 вертик. срез XZ)")
+    plt.colorbar(im3, ax=axes[1,1], label='p')
+
+    plt.tight_layout()
+    out = f"tornado_frame_{frame:04d}.png"
+    plt.savefig(out, dpi=150)
+    print(f"Сохранено: {out}")
+    plt.show()
 
 
 # ═══════════════════════════════════════════════════════
-# §9. ЭКСПОРТ VTK + PVD (вызывается автоматически после симуляции)
+# §8. ЭКСПОРТ VTK + PVD (вызывается автоматически после симуляции)
 # ═══════════════════════════════════════════════════════
 def export_vtk(snap_dir="snapshots_tornado", lx=None, ly=None, lz=None):
     """
@@ -347,67 +347,70 @@ def export_vtk(snap_dir="snapshots_tornado", lx=None, ly=None, lz=None):
     logger.info(f"🎬  Открыть в ParaView: {pvd_path}")
 
 
-def visualize(snap_dir="snapshots_tornado", frame=0, nz_slice=None):
-    """
-    Строит 4 панели для заданного снапшота:
-      (a) |u| в плоскости z=const (горизонтальный срез)
-      (b) |ω| в том же срезе
-      (c) b   в том же срезе
-      (d) p   в вертикальном срезе y=0 (XZ-плоскость)
+# ═══════════════════════════════════════════════════════
+# §9. ГЛАВНЫЙ ЦИКЛ ИНТЕГРИРОВАНИЯ
+# (FileHandler, CFL и flow — только при запуске, не при импорте)
+# ═══════════════════════════════════════════════════════
+if __name__ == '__main__':
+    # ── Запись снапшотов каждые 0.05 единиц времени ────
+    snapshots = solver.evaluator.add_file_handler(
+        "snapshots_tornado", sim_dt=0.05, max_writes=400
+    )
+    snapshots.add_task(speed,  name="speed")
+    snapshots.add_task(wmag,   name="vorticity_mag")
+    snapshots.add_task(b,      name="buoyancy")
+    snapshots.add_task(p,      name="pressure")
+    snapshots.add_task(u,      name="velocity")   # полный 3D вектор
 
-    Использование:
-      from tornado_3d import visualize
-      visualize(frame=10)
-    """
-    import h5py
-    import matplotlib.pyplot as plt
-    import glob, os
+    # ── CFL: адаптивный шаг ────────────────────────────
+    # dt = safety · Δx / max|u|   (обеспечивает устойчивость)
+    CFL = d3.CFL(
+        solver,
+        initial_dt  = max_timestep,
+        cadence     = 10,
+        safety      = 0.3,
+        threshold   = 0.1,
+        max_change  = 1.5,
+        min_change  = 0.5,
+        max_dt      = max_timestep,
+    )
+    CFL.add_velocity(u)
 
-    files = sorted(glob.glob(os.path.join(snap_dir, "*.h5")))
-    if not files:
-        print(f"Нет .h5 файлов в {snap_dir}/")
-        return
+    # ── Мониторинг в лог ───────────────────────────────
+    flow = d3.GlobalFlowProperty(solver, cadence=10)
+    flow.add_property(speed, name='speed')
+    flow.add_property(wmag,  name='omega')
+    flow.add_property(b,     name='buoyancy')
 
-    with h5py.File(files[0], 'r') as f:
-        times  = f['scales/sim_time'][:]
-        speed  = f['tasks/speed'][frame, :, :, :]      # (Nx,Ny,Nz)
-        wmag   = f['tasks/vorticity_mag'][frame, :, :, :]
-        buoy   = f['tasks/buoyancy'][frame, :, :, :]
-        pres   = f['tasks/pressure'][frame, :, :, :]
+    try:
+        logger.info("══════════════════════════════════════")
+        logger.info(" Запуск симуляции смерча (Dedalus v3) ")
+        logger.info(f" Re={Re:.0e}, Pr={Pr}, Γ={Gamma}, r_c={r_c}")
+        logger.info(f" Nx=Ny=Nz={Nx},  T_max={stop_sim_time}")
+        logger.info("══════════════════════════════════════")
+        while solver.proceed:
+            dt = CFL.compute_timestep()
+            solver.step(dt)
+            if (solver.iteration - 1) % 20 == 0:
+                logger.info(
+                    f"it={solver.iteration:6d} | "
+                    f"t={solver.sim_time:8.4f} | "
+                    f"dt={dt:8.2e} | "
+                    f"max|u|={flow.max('speed'):7.3f} | "
+                    f"max|ω|={flow.max('omega'):7.3f} | "
+                    f"max b={flow.max('buoyancy'):7.3f}"
+                )
+    except Exception:
+        logger.exception("Ошибка в главном цикле — завершение.")
+        raise
+    finally:
+        solver.log_stats()
 
-    Nz = speed.shape[2]
-    iz  = Nz // 2 if nz_slice is None else nz_slice   # горизонт. срез
-    iy  = speed.shape[1] // 2                           # вертик. срез
-
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle(f"Смерч  |  t = {times[frame]:.2f}", fontsize=14, fontweight='bold')
-
-    kw = dict(origin='lower', cmap='hot', aspect='equal')
-    im0 = axes[0,0].imshow(speed[:,:,iz].T, **kw)
-    axes[0,0].set_title("|u| — скорость (z-срез)")
-    plt.colorbar(im0, ax=axes[0,0], label='|u|')
-
-    im1 = axes[0,1].imshow(wmag[:,:,iz].T, **{**kw, 'cmap':'plasma'})
-    axes[0,1].set_title("|ω| — завихрённость (z-срез)")
-    plt.colorbar(im1, ax=axes[0,1], label='|ω|')
-
-    im2 = axes[1,0].imshow(buoy[:,:,iz].T, **{**kw, 'cmap':'RdYlBu_r'})
-    axes[1,0].set_title("b — плавучесть / тепло (z-срез)")
-    plt.colorbar(im2, ax=axes[1,0], label='b')
-
-    im3 = axes[1,1].imshow(pres[:,iy,:].T, **{**kw, 'cmap':'coolwarm'})
-    axes[1,1].set_title("p — давление (y=0 вертик. срез XZ)")
-    plt.colorbar(im3, ax=axes[1,1], label='p')
-
-    plt.tight_layout()
-    out = f"tornado_frame_{frame:04d}.png"
-    plt.savefig(out, dpi=150)
-    print(f"Сохранено: {out}")
-    plt.show()
+    export_vtk()
 
 
 # ═══════════════════════════════════════════════════════
-# §9. ОПЦИОНАЛЬНЫЙ БЛОК: f-ПЛОСКОСТЬ КОРИОЛИСА
+# §10. ОПЦИОНАЛЬНЫЙ БЛОК: f-ПЛОСКОСТЬ КОРИОЛИСА
 # ═══════════════════════════════════════════════════════
 #
 # Для добавления Coriolis-силы f·(ẑ×u) в уравнение движения
