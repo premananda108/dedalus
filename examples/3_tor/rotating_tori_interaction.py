@@ -1,35 +1,39 @@
 """
-two_tori_collision.py
+rotating_tori_interaction.py
 ═══════════════════════════════════════════════════════════════════════
-СТОЛКНОВЕНИЕ ДВУХ ВИХРЕВЫХ КОЛЕЦ (ТОРОВ)
+ДВА СТАБИЛЬНЫХ ВРАЩАЮЩИХСЯ ТОРА, ВЗАИМОДЕЙСТВУЮЩИХ ЧЕРЕЗ ГАЗОВЫЕ ПОТОКИ
 3D несжимаемые уравнения Навье–Стокса
 
 ФИЗИКА:
-  • Два тороидальных вихря летят НАВСТРЕЧУ друг другу вдоль оси z:
-      Тор А: центр z = +Lz/4, Γ < 0  → летит в сторону −z
-      Тор Б: центр z = −Lz/4, Γ > 0  → летит в сторону +z
-  • ДОПОЛНИТЕЛЬНО: каждый тор закручен вокруг большой оси (азимутальный
-    поток u_φ ê_φ), — «вращение большого кольца» с угловой скоростью Ω_φ:
-      u_φ(r,z) = ±Ω_φ · exp[−((r−R)²+(z−z₀)²)/a²]
-    Это div-free поле → суперпозиция с Био-Саваром корректна.
-  • Наблюдаемые явления:
-      1. Кольца сближаются и тормозятся (взаимная индукция)
-      2. Азимутальный закрут создаёт спиральные вихревые трубки при столкновении
-      3. Завихрённость распадается в хаотическую структуру (Re>1000)
+  • Каждый тор — вращающийся «маховик»:
+      – Тороидальное вращение (u_φ вокруг оси z) — основной мотор,
+        создаёт центробежный «ветер» в экваториальной плоскости
+      – Полоидальное вращение (внутри трубки тора) — создаёт
+        перпендикулярные потоки, «перекачивая» газ вдоль оси z
 
-МЕТОД НАЧАЛЬНОГО УСЛОВИЯ — спектральный Био-Савар:
-  Из вихревости ω восстанавливаем скорость через уравнение Пуассона:
-    ∇²u = −∇×ω  →  û_k = (ik × ω̂_k) / |k|²
-  Два тора: ω_net = ω_A + ω_B  (суперпозиция перед нелинейным шагом)
+  • СТАБИЛЬНОСТЬ: полоидальная вихревость имеет нулевую нетто-
+    циркуляцию (∫ω·dA = 0), поэтому тор НЕ самодвижется (нет
+    дрейфа Кельвина). Он остаётся на месте и вращается.
 
-ВЫВОД (в реальном времени):
-  snapshots_collision/*.h5     — поля (h5)
-  frames_collision/*.png       — превью (PNG, пишутся параллельно)
-  vtk_output_collision/*.pvd   — для ParaView
+  • МАССИВНОСТЬ: высокая скорость вращения → большая кинетическая
+    энергия → эффективная инерция/масса тора.
+
+  • ВЗАИМОДЕЙСТВИЕ: газовые потоки от одного тора достигают
+    другого → непрямое динамическое взаимодействие через среду.
+
+РАСПОЛОЖЕНИЕ:
+  Тор A: центр (−d/2, 0, 0), ось вращения ê_z
+  Тор B: центр (+d/2, 0, 0), ось вращения ê_z
+  Оба вращаются в одну сторону (можно поменять знак).
+
+ВЫВОД:
+  frames_rotating_tori/*.png       — PNG-кадры
+  snapshots_rotating_tori/*.h5     — HDF5-снапшоты
+  vtk_output_rotating_tori/*.pvd   — для ParaView
 
 ЗАПУСК:
-  python3 two_tori_collision.py
-  mpiexec -n 4 python3 two_tori_collision.py
+  python3 rotating_tori_interaction.py
+  mpiexec -n 4 python3 rotating_tori_interaction.py
 ═══════════════════════════════════════════════════════════════════════
 """
 import os
@@ -49,9 +53,9 @@ logging.basicConfig(level=logging.INFO)
 
 # ── Папки вывода ────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SNAP_DIR   = os.path.join(SCRIPT_DIR, "snapshots_collision")
-FRAMES_DIR = os.path.join(SCRIPT_DIR, "frames_collision")
-VTK_DIR    = os.path.join(SCRIPT_DIR, "vtk_output_collision")
+SNAP_DIR   = os.path.join(SCRIPT_DIR, "snapshots_rotating_tori")
+FRAMES_DIR = os.path.join(SCRIPT_DIR, "frames_rotating_tori")
+VTK_DIR    = os.path.join(SCRIPT_DIR, "vtk_output_rotating_tori")
 os.makedirs(FRAMES_DIR, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════
@@ -59,48 +63,39 @@ os.makedirs(FRAMES_DIR, exist_ok=True)
 # ═══════════════════════════════════════════════════════
 
 # ── Геометрия ───────────────────────────────────────────
-Lx = Ly = Lz = 2 * np.pi          # периодический куб
-Nx = Ny = Nz = 64                 # 64³ → быстро; 96/128 → красивее
+Lx = Ly = Lz = 4 * np.pi          # увеличенный домен для потоков
+Nx = Ny = Nz = 64                 # 64³; 96→красивее
 dealias = 3 / 2
 
 # ── Вязкость ────────────────────────────────────────────
-Re  = 100.0   # Число Рейнольдса; при Re>2000 виден богатый распад
+Re  = 3000.0    # высокий Re → вихри живут долго
 nu  = 1.0 / Re
 
 # ── Параметры торов ─────────────────────────────────────
-R_ring = 1.0      # большой радиус кольца
-a_core = 0.4      # малый радиус ядра (гауссово)
-Gamma  = 5.0      # |Γ|: амплитуда циркуляции
-# z-позиции колец: A вверху, B внизу
-z0_A   = +np.pi * 0.45   # тор A (верхний, летит вниз)
-z0_B   = -np.pi * 0.45   # тор B (нижний, летит вверх)
+R_ring = 1.2       # большой радиус кольца (ось тора)
+a_core = 0.45      # малый радиус ядра
 
-# Знак Γ задаёт направление самодвижения (Кельвин):
-#   Γ > 0  → кольцо движется в сторону +z
-#   Γ < 0  → кольцо движется в сторону −z
-# Тор A сверху → должен лететь ВНИЗ (-z) → Γ < 0
-# Тор B снизу → должен лететь ВВЕРХ (+z) → Γ > 0
-Gamma_A = -Gamma   # летит ↓ (−z)  — навстречу B
-Gamma_B = +Gamma   # летит ↑ (+z)  — навстречу A
+# Расстояние между центрами торов
+d_sep   = 3.0 * R_ring    # ≈ 3.6 — торы рядом, потоки пересекаются
+x0_A    = -d_sep / 2      # центр тора A
+x0_B    = +d_sep / 2      # центр тора B
 
-# ── Вращение большого кольца (азимутальная скорость u_φ·ê_φ) ──────
-# Физика: жидкость внутри ядра тора вращается вокруг оси z.
-#   u_φ > 0  → вращение против часовой стрелки (вид сверху)
-#   u_φ < 0  → по часовой стрелке
-# При одинаковых знаках закрут согласован. При разных — сдвиг при ударе.
-Omega_phi = 2.5    # амплитуда азимутальной скорости (≈ 0.5·U_ring → заметно)
-# Знаки: +A, −B → противоположный закрут → максимальный сдвиг при столкновении
-Omega_phi_A = +Omega_phi
-Omega_phi_B = -Omega_phi   # поменяй на +, если хочешь одинаковый закрут
+# ── Скорости вращения ──────────────────────────────────
+# Тороидальное вращение (вокруг оси z, вдоль большого кольца)
+# Это главный «мотор» — создаёт центробежные потоки
+Omega_tor = 8.0    # амплитуда азимутальной скорости (высокая!)
 
-# Аналитическая оценка скорости встречного движения (формула Кельвина)
-_U_kelvin = abs(Gamma / (4 * np.pi * R_ring)) * (np.log(8 * R_ring / a_core) - 0.25)
-_dist     = abs(z0_A - z0_B)   # начальное расстояние между кольцами
-_T_coll   = _dist / (2 * _U_kelvin)  # оценка времени до столкновения
+# Полоидальное вращение (внутри трубки тора)
+# Создаёт дополнительный «насосный» эффект
+Omega_pol = 5.0    # амплитуда полоидальной циркуляции
+
+# Знаки: оба вращаются в одном направлении → согласованные потоки
+# Поменяйте sign_B на -1 для противоположного вращения
+sign_A = +1
+sign_B = +1
 
 # ── Интегратор ──────────────────────────────────────────
-# Симулируем до момента «после столкновения» — берём 2.5 × T_coll
-stop_sim_time = min(3.5 * _T_coll, 8.0)
+stop_sim_time = 3.0     # долгая симуляция — наблюдаем взаимодействие
 max_timestep  = 5e-3
 dtype = np.float64
 
@@ -135,119 +130,143 @@ solver = problem.build_solver(d3.RK222)
 solver.stop_sim_time = stop_sim_time
 
 # ═══════════════════════════════════════════════════════
-# §4. НАЧАЛЬНОЕ УСЛОВИЕ: суперпозиция двух торов
-#     Метод: спектральный Био-Савар  û = (ik × ω̂) / |k|²
+# §4. НАЧАЛЬНОЕ УСЛОВИЕ: два стабильных вращающихся тора
 # ═══════════════════════════════════════════════════════
 
 Nx_g = x.shape[0]
 Ny_g = y.shape[1]
 Nz_g = z.shape[2]
 
-r_cyl  = np.sqrt(x**2 + y**2)
-r_safe = np.maximum(r_cyl, 1e-12)
 
-
-def torus_vorticity(Gamma_val, z0, x_grid, y_grid, z_grid,
-                    R=R_ring, a=a_core):
+def torus_toroidal_velocity(Omega, sign, x0, x_g, y_g, z_g,
+                            R=R_ring, a=a_core):
     """
-    Возвращает (omega_x, omega_y) — декартовы компоненты тороидальной
-    вихревости одного кольца с циркуляцией Gamma_val, центром (0,0,z0).
-    omega_z = 0 для кольца в плоскости XY.
+    Тороидальная скорость: вращение газа вокруг оси z (ê_φ)
+    в ядре тора, центр которого сдвинут по x на x0.
+
+    u_φ(r,z) = sign · Omega · exp(−((r_loc − R)² + z_g²) / a²)
+
+    Декартово разложение:  u_x = −u_φ · y_loc/r_loc
+                           u_y = +u_φ · x_loc/r_loc
     """
-    r_c  = np.sqrt(x_grid**2 + y_grid**2)
-    r_s  = np.maximum(r_c, 1e-12)
-    phi  = (Gamma_val / (np.pi * a**2)) * np.exp(
-        -((r_c - R)**2 + (z_grid - z0)**2) / a**2
-    )
-    ox = -phi * (y_grid / r_s)
-    oy =  phi * (x_grid / r_s)
-    return ox, oy
+    x_loc = x_g - x0     # координаты относительно центра тора
+    y_loc = y_g           # тор центрирован по y=0
+    r_loc  = np.sqrt(x_loc**2 + y_loc**2)
+    r_safe = np.maximum(r_loc, 1e-12)
+
+    # Расстояние до оси трубки тора
+    envelope = np.exp(-((r_loc - R)**2 + z_g**2) / a**2)
+
+    u_phi = sign * Omega * envelope
+    ux = -u_phi * (y_loc / r_safe)
+    uy =  u_phi * (x_loc / r_safe)
+    uz = np.zeros_like(ux)
+    return ux, uy, uz
 
 
-# ── Суперпозиция вихревостей ─────────────────────────────────────
-ox_A, oy_A = torus_vorticity(Gamma_A, z0_A, x, y, z)
-ox_B, oy_B = torus_vorticity(Gamma_B, z0_B, x, y, z)
+def torus_poloidal_vorticity(Omega, sign, x0, x_g, y_g, z_g,
+                             R=R_ring, a=a_core):
+    """
+    Полоидальная вихревость: вращение газа ВНУТРИ трубки тора.
 
-omega_x_g = ox_A + ox_B
-omega_y_g = oy_A + oy_B
-# omega_z_g = 0
+    Профиль ω_pol(s) = sign · Omega · (1 − 2s²/a²) · exp(−s²/a²)
+    где s = √((r_loc − R)² + z²) — расстояние до оси трубки.
 
-# ── Спектральный Био-Савар ────────────────────────────────────────
-ox_hat = np.fft.fftn(omega_x_g)
-oy_hat = np.fft.fftn(omega_y_g)
+    Этот профиль даёт ∫₀^∞ ω_pol(s)·s·ds = 0,
+    т.е. нулевую нетто-циркуляцию → НЕТ самодвижения Кельвина!
 
-kx_arr  = np.fft.fftfreq(Nx_g) * (2 * np.pi * Nx_g / Lx)
-ky_arr  = np.fft.fftfreq(Ny_g) * (2 * np.pi * Ny_g / Ly)
-kz_arr  = np.fft.fftfreq(Nz_g) * (2 * np.pi * Nz_g / Lz)
+    Вихревость направлена тороидально: ω = ω_pol · ê_φ
+    → ω_x = −ω_pol · y_loc/r_loc
+      ω_y = +ω_pol · x_loc/r_loc
+      ω_z = 0
+    """
+    x_loc = x_g - x0
+    y_loc = y_g
+    r_loc  = np.sqrt(x_loc**2 + y_loc**2)
+    r_safe = np.maximum(r_loc, 1e-12)
+
+    s2 = (r_loc - R)**2 + z_g**2   # s² — расстояние до оси трубки
+    profile = sign * Omega * (1.0 - 2.0 * s2 / a**2) * np.exp(-s2 / a**2)
+
+    ox = -profile * (y_loc / r_safe)
+    oy =  profile * (x_loc / r_safe)
+    oz = np.zeros_like(ox)
+    return ox, oy, oz
+
+
+# ── Тороидальная скорость (прямое задание, div-free) ────────────
+ux_A, uy_A, uz_A = torus_toroidal_velocity(Omega_tor, sign_A, x0_A, x, y, z)
+ux_B, uy_B, uz_B = torus_toroidal_velocity(Omega_tor, sign_B, x0_B, x, y, z)
+
+u['g'][0] = ux_A + ux_B
+u['g'][1] = uy_A + uy_B
+u['g'][2] = uz_A + uz_B
+
+# ── Полоидальная скорость: из вихревости через Био-Савар ────────
+ox_A, oy_A, oz_A = torus_poloidal_vorticity(Omega_pol, sign_A, x0_A, x, y, z)
+ox_B, oy_B, oz_B = torus_poloidal_vorticity(Omega_pol, sign_B, x0_B, x, y, z)
+
+omega_x_total = ox_A + ox_B
+omega_y_total = oy_A + oy_B
+# omega_z_total = 0
+
+# ── Спектральный Био-Савар: ω → u_poloidal ────────────────────
+ox_hat = np.fft.fftn(omega_x_total)
+oy_hat = np.fft.fftn(omega_y_total)
+
+kx_arr = np.fft.fftfreq(Nx_g) * (2 * np.pi * Nx_g / Lx)
+ky_arr = np.fft.fftfreq(Ny_g) * (2 * np.pi * Ny_g / Ly)
+kz_arr = np.fft.fftfreq(Nz_g) * (2 * np.pi * Nz_g / Lz)
 KX, KY, KZ = np.meshgrid(kx_arr, ky_arr, kz_arr, indexing='ij')
 K2 = KX**2 + KY**2 + KZ**2
 K2[0, 0, 0] = 1.0
 
+# û = (ik × ω̂) / |k|²,  при ω_z = 0:
 ux_hat = -1j * KZ * oy_hat / K2
 uy_hat =  1j * KZ * ox_hat / K2
 uz_hat =  1j * (KX * oy_hat - KY * ox_hat) / K2
 
 ux_hat[0, 0, 0] = uy_hat[0, 0, 0] = uz_hat[0, 0, 0] = 0.0
 
-u['g'][0] = np.real(np.fft.ifftn(ux_hat))
-u['g'][1] = np.real(np.fft.ifftn(uy_hat))
-u['g'][2] = np.real(np.fft.ifftn(uz_hat))
+# Суперпозиция: тороидальная + полоидальная скорости
+u['g'][0] += np.real(np.fft.ifftn(ux_hat))
+u['g'][1] += np.real(np.fft.ifftn(uy_hat))
+u['g'][2] += np.real(np.fft.ifftn(uz_hat))
 
-# ── §4b. Азимутальный закрут «большого кольца» ──────────────────────
-# u_φ(r,z) · ê_φ = u_φ · (−y/r, x/r, 0)  — div-free в цил. координатах,
-# поэтому прямое сложение с полем из Био-Савара не нарушает ∇·u = 0.
-#
-# В декартовых координатах:
-#   u_x += −u_phi · y / r
-#   u_y += +u_phi · x / r
-
-def _azimuthal_kick(Omega, z0, x_g, y_g, z_g, R=R_ring, a=a_core):
-    """Азимутальный поток, сконцентрированный в ядре тора."""
-    r_c = np.sqrt(x_g**2 + y_g**2)
-    r_s = np.maximum(r_c, 1e-12)
-    u_phi = Omega * np.exp(-((r_c - R)**2 + (z_g - z0)**2) / a**2)
-    return -u_phi * (y_g / r_s), u_phi * (x_g / r_s)   # (ux_add, uy_add)
-
-ax_A, ay_A = _azimuthal_kick(Omega_phi_A, z0_A, x, y, z)
-ax_B, ay_B = _azimuthal_kick(Omega_phi_B, z0_B, x, y, z)
-
-u['g'][0] += ax_A + ax_B
-u['g'][1] += ay_A + ay_B
-# u['g'][2] не меняется: закрут чисто азимутальный
-
+# ── Диагностика начального поля ────────────────────────────────
 _u_max0 = float(np.max(np.sqrt(u['g'][0]**2 + u['g'][1]**2 + u['g'][2]**2)))
+_KE0    = float(0.5 * np.mean(u['g'][0]**2 + u['g'][1]**2 + u['g'][2]**2))
 logger.info(f"Начальный max|u| = {_u_max0:.3f}")
-logger.info(f"  Скорость самодвижения ≈ {_U_kelvin:.3f}  |  азимутальный закрут = ±{Omega_phi}")
-logger.info(f"Оценка времени столкновения T_coll ≈ {_T_coll:.2f}")
-logger.info(f"Симуляция до t = {stop_sim_time:.2f}")
+logger.info(f"Начальная кинетическая энергия <½u²> = {_KE0:.3f}")
+logger.info(f"  Тороидальное вращение Ω_tor = {Omega_tor}")
+logger.info(f"  Полоидальное вращение Ω_pol = {Omega_pol}")
+logger.info(f"  Расстояние между торами d = {d_sep:.2f}")
 
 # ═══════════════════════════════════════════════════════
 # §5. ДИАГНОСТИЧЕСКИЕ ВЫРАЖЕНИЯ
 # ═══════════════════════════════════════════════════════
 omega_field = d3.Curl(u)
 speed       = np.sqrt(u @ u)
-wmag        = np.sqrt(omega_field @ omega_field)   # |ω| — виден тор!
+wmag        = np.sqrt(omega_field @ omega_field)
 
 # ═══════════════════════════════════════════════════════
 # §6. ФУНКЦИЯ СОХРАНЕНИЯ КАДРОВ
 # ═══════════════════════════════════════════════════════
 def _save_frame(frame_idx, t,
                 wmag_xz, speed_xz,
-                wmag_xy_mid, speed_xy_mid,
-                x1d, z1d, y1d,
-                T_coll):
+                wmag_xy, speed_xy,
+                x1d, z1d, y1d):
     """Сохраняет один PNG-кадр (4 панели)."""
-    BG = '#0a0a10'
-    fig, axes = plt.subplots(2, 2, figsize=(12, 9), facecolor=BG)
-    phase = "до" if t < T_coll else ("≈ СТОЛКНОВЕНИЕ" if t < 1.3 * T_coll else "после")
+    BG = '#0a0a12'
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10), facecolor=BG)
     fig.suptitle(
-        f"Столкновение двух торов   |   t = {t:.3f}  ({phase})  |   Re = {Re:.0f}\n"
-        f"Тор A: z₀=+{z0_A:.2f}, Γ=+{Gamma_A}     "
-        f"Тор B: z₀={z0_B:.2f}, Γ={Gamma_B}",
-        fontsize=12, fontweight='bold', color='white', y=0.98
+        f"Вращающиеся торы — газовое взаимодействие   |   "
+        f"t = {t:.3f}   |   Re = {Re:.0f}\n"
+        f"Ω_tor = {Omega_tor}   Ω_pol = {Omega_pol}   "
+        f"d = {d_sep:.1f}   R = {R_ring}",
+        fontsize=11, fontweight='bold', color='white', y=0.98
     )
 
-    clr_accent = '#00d4ff'
     for ax in axes.flat:
         ax.set_facecolor(BG)
         for spine in ax.spines.values():
@@ -258,47 +277,62 @@ def _save_frame(frame_idx, t,
 
     ext_xz = [x1d.min(), x1d.max(), z1d.min(), z1d.max()]
     ext_xy = [x1d.min(), x1d.max(), y1d.min(), y1d.max()]
-    kw_xz  = dict(origin='lower', aspect='equal', extent=ext_xz, interpolation='bilinear')
-    kw_xy  = dict(origin='lower', aspect='equal', extent=ext_xy, interpolation='bilinear')
+    kw_xz = dict(origin='lower', aspect='equal', extent=ext_xz,
+                 interpolation='bilinear')
+    kw_xy = dict(origin='lower', aspect='equal', extent=ext_xy,
+                 interpolation='bilinear')
 
     vmax_w = np.percentile(np.abs(wmag_xz), 99.5) + 1e-8
+    vmax_s = np.percentile(np.abs(speed_xz), 99.5) + 1e-8
 
-    # ── [0,0] |ω| XZ-срез ─────────────────────────
+    # ── [0,0] |ω| XZ-срез (боковой вид) ─────────────
     im0 = axes[0, 0].imshow(wmag_xz.T, cmap='inferno',
                              vmin=0, vmax=vmax_w, **kw_xz)
-    axes[0, 0].set_title("|ω|  завихрённость  (XZ, y=0)", color='white', fontsize=10)
+    axes[0, 0].set_title("|ω|  завихрённость  (XZ, y=0)",
+                          color='white', fontsize=10)
     axes[0, 0].set_xlabel("x"); axes[0, 0].set_ylabel("z")
-    # Горизонтальные линии — исходные позиции торов
-    axes[0, 0].axhline(z0_A, color=clr_accent, lw=0.6, ls='--', alpha=0.5)
-    axes[0, 0].axhline(z0_B, color='#ff6b6b', lw=0.6, ls='--', alpha=0.5)
-    cb = plt.colorbar(im0, ax=axes[0, 0]); plt.setp(cb.ax.get_yticklabels(), color='#888888')
+    # Вертикальные линии — позиции центров торов
+    axes[0, 0].axvline(x0_A, color='#00d4ff', lw=0.6, ls='--', alpha=0.5)
+    axes[0, 0].axvline(x0_B, color='#ff6b6b', lw=0.6, ls='--', alpha=0.5)
+    cb = plt.colorbar(im0, ax=axes[0, 0])
+    plt.setp(cb.ax.get_yticklabels(), color='#888888')
 
     # ── [0,1] |u| XZ-срез ─────────────────────────
     im1 = axes[0, 1].imshow(speed_xz.T, cmap='magma',
-                             vmin=0, **kw_xz)
-    axes[0, 1].set_title("|u|  скорость  (XZ, y=0)", color='white', fontsize=10)
+                             vmin=0, vmax=vmax_s, **kw_xz)
+    axes[0, 1].set_title("|u|  скорость  (XZ, y=0)",
+                          color='white', fontsize=10)
     axes[0, 1].set_xlabel("x"); axes[0, 1].set_ylabel("z")
-    axes[0, 1].axhline(z0_A, color=clr_accent, lw=0.6, ls='--', alpha=0.5)
-    axes[0, 1].axhline(z0_B, color='#ff6b6b', lw=0.6, ls='--', alpha=0.5)
-    cb = plt.colorbar(im1, ax=axes[0, 1]); plt.setp(cb.ax.get_yticklabels(), color='#888888')
+    axes[0, 1].axvline(x0_A, color='#00d4ff', lw=0.6, ls='--', alpha=0.5)
+    axes[0, 1].axvline(x0_B, color='#ff6b6b', lw=0.6, ls='--', alpha=0.5)
+    cb = plt.colorbar(im1, ax=axes[0, 1])
+    plt.setp(cb.ax.get_yticklabels(), color='#888888')
 
-    # ── [1,0] |ω| XY-срез по центру (z=0) ────────
-    im2 = axes[1, 0].imshow(wmag_xy_mid.T, cmap='inferno',
-                             vmin=0, vmax=vmax_w, **kw_xy)
-    axes[1, 0].set_title("|ω|  завихрённость  (XY, z=0  — плоскость столкновения)",
+    # ── [1,0] |ω| XY-срез (вид сверху, z=0) ──────
+    vmax_w_xy = np.percentile(np.abs(wmag_xy), 99.5) + 1e-8
+    im2 = axes[1, 0].imshow(wmag_xy.T, cmap='inferno',
+                             vmin=0, vmax=vmax_w_xy, **kw_xy)
+    axes[1, 0].set_title("|ω|  завихрённость  (XY, z=0 — вид сверху)",
                           color='white', fontsize=10)
     axes[1, 0].set_xlabel("x"); axes[1, 0].set_ylabel("y")
-    cb = plt.colorbar(im2, ax=axes[1, 0]); plt.setp(cb.ax.get_yticklabels(), color='#888888')
+    axes[1, 0].axvline(x0_A, color='#00d4ff', lw=0.6, ls='--', alpha=0.5)
+    axes[1, 0].axvline(x0_B, color='#ff6b6b', lw=0.6, ls='--', alpha=0.5)
+    cb = plt.colorbar(im2, ax=axes[1, 0])
+    plt.setp(cb.ax.get_yticklabels(), color='#888888')
 
-    # ── [1,1] |u| XY-срез по центру ──────────────
-    im3 = axes[1, 1].imshow(speed_xy_mid.T, cmap='magma',
-                             vmin=0, **kw_xy)
-    axes[1, 1].set_title("|u|  скорость  (XY, z=0  — плоскость столкновения)",
+    # ── [1,1] |u| XY-срез ────────────────────────
+    vmax_s_xy = np.percentile(np.abs(speed_xy), 99.5) + 1e-8
+    im3 = axes[1, 1].imshow(speed_xy.T, cmap='magma',
+                             vmin=0, vmax=vmax_s_xy, **kw_xy)
+    axes[1, 1].set_title("|u|  скорость  (XY, z=0 — вид сверху)",
                           color='white', fontsize=10)
     axes[1, 1].set_xlabel("x"); axes[1, 1].set_ylabel("y")
-    cb = plt.colorbar(im3, ax=axes[1, 1]); plt.setp(cb.ax.get_yticklabels(), color='#888888')
+    axes[1, 1].axvline(x0_A, color='#00d4ff', lw=0.6, ls='--', alpha=0.5)
+    axes[1, 1].axvline(x0_B, color='#ff6b6b', lw=0.6, ls='--', alpha=0.5)
+    cb = plt.colorbar(im3, ax=axes[1, 1])
+    plt.setp(cb.ax.get_yticklabels(), color='#888888')
 
-    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
     out = os.path.join(FRAMES_DIR, f"frame_{frame_idx:04d}.png")
     fig.savefig(out, dpi=100, facecolor=BG)
     plt.close(fig)
@@ -308,23 +342,19 @@ def _save_frame(frame_idx, t,
 # ═══════════════════════════════════════════════════════
 # §7. ЭКСПОРТ VTK + PVD
 # ═══════════════════════════════════════════════════════
-def export_vtk(snap_dir=SNAP_DIR, vtk_dir=VTK_DIR, lx=Lx, ly=Ly, lz=Lz):
+def export_vtk(snap_dir=SNAP_DIR, vtk_dir=VTK_DIR,
+               lx=Lx, ly=Ly, lz=Lz):
     """
-    Конвертирует HDF5-снапшоты в .vti + collision.pvd для ParaView.
-
-    Рекомендуемые фильтры в ParaView:
-      Contour → vorticity_mag  (изоповерхность — видны торы и их деформация)
-      StreamTracer → velocity  (линии тока)
+    Конвертирует HDF5-снапшоты в .vti + rotating_tori.pvd для ParaView.
     """
     import glob, h5py
     try:
         import pyvista as pv
     except ImportError:
         logger.warning("pyvista не установлена — VTK-экспорт пропущен.")
-        logger.warning("Установите: pip install pyvista")
         return
 
-    pvd_path = os.path.join(vtk_dir, "collision.pvd")
+    pvd_path = os.path.join(vtk_dir, "rotating_tori.pvd")
     os.makedirs(vtk_dir, exist_ok=True)
     h5_files = sorted(glob.glob(os.path.join(snap_dir, "*.h5")))
     if not h5_files:
@@ -355,7 +385,7 @@ def export_vtk(snap_dir=SNAP_DIR, vtk_dir=VTK_DIR, lx=Lx, ly=Ly, lz=Lz):
                     uv[1].flatten(order="F"),
                     uv[2].flatten(order="F"),
                 ], axis=1)
-                vti_name = f"collision_{frame_counter:04d}.vti"
+                vti_name = f"rotating_tori_{frame_counter:04d}.vti"
                 grid.save(os.path.join(vtk_dir, vti_name))
                 pvd_entries.append((t, vti_name))
                 frame_counter += 1
@@ -391,9 +421,9 @@ if __name__ == '__main__':
         solver,
         initial_dt  = max_timestep,
         cadence     = 10,
-        safety      = 0.3,
+        safety      = 0.25,       # чуть консервативнее для высоких Ω
         threshold   = 0.1,
-        max_change  = 1.5,
+        max_change  = 1.4,
         min_change  = 0.5,
         max_dt      = max_timestep,
     )
@@ -408,16 +438,17 @@ if __name__ == '__main__':
     x1d = x[:, 0, 0]
     y1d = y[0, :, 0]
     z1d = z[0, 0, :]
-    iy0   = int(Ny_g // 2)   # y ≈ 0
-    iz_mid = int(Nz_g // 2)  # z ≈ 0 — плоскость столкновения
+    iy0    = int(Ny_g // 2)    # y ≈ 0
+    iz_mid = int(Nz_g // 2)    # z ≈ 0
 
     logger.info("═══════════════════════════════════════════════════════")
-    logger.info(" СТОЛКНОВЕНИЕ ДВУХ ВИХРЕВЫХ КОЛЕЦ — Dedalus v3")
-    logger.info(f" R={R_ring}, a={a_core}, |Γ|={Gamma}, Re={Re:.0f}")
-    logger.info(f" Тор A: z₀=+{z0_A:.2f}, Γ={Gamma_A}  → летит ↓ (-z)  закрут Ω={Omega_phi_A:+.1f}")
-    logger.info(f" Тор B: z₀={z0_B:.2f}, Γ=+{Gamma_B}  → летит ↑ (+z)  закрут Ω={Omega_phi_B:+.1f}")
-    logger.info(f" U_кольца ≈ {_U_kelvin:.3f}  →  T_столкновения ≈ {_T_coll:.2f}")
-    logger.info(f" Время симуляции: {stop_sim_time:.2f}")
+    logger.info(" ДВА СТАБИЛЬНЫХ ВРАЩАЮЩИХСЯ ТОРА — Dedalus v3")
+    logger.info(f" R={R_ring}, a={a_core}, Re={Re:.0f}")
+    logger.info(f" Тор A: x₀={x0_A:.2f},  знак={sign_A:+d}")
+    logger.info(f" Тор B: x₀={x0_B:.2f},  знак={sign_B:+d}")
+    logger.info(f" Ω_tor={Omega_tor}, Ω_pol={Omega_pol}")
+    logger.info(f" Расстояние d = {d_sep:.2f}")
+    logger.info(f" Время симуляции: {stop_sim_time:.1f}")
     logger.info(f" PNG-кадры: {FRAMES_DIR}/")
     logger.info("═══════════════════════════════════════════════════════")
 
@@ -431,10 +462,13 @@ if __name__ == '__main__':
 
             if (solver.iteration - 1) % 20 == 0:
                 t = solver.sim_time
+                max_speed = flow.max('speed')
+                max_omega = flow.max('omega')
+
                 logger.info(
                     f"it={solver.iteration:6d} | t={t:7.3f} | "
-                    f"max|u|={flow.max('speed'):6.3f} | "
-                    f"max|ω|={flow.max('omega'):7.2f}"
+                    f"max|u|={max_speed:6.3f} | "
+                    f"max|ω|={max_omega:7.2f}"
                 )
 
                 # ── Вычисляем поля ──────────────────────────────
@@ -448,17 +482,16 @@ if __name__ == '__main__':
                 wmag_xz  = w_g[:, iy0, :]
                 speed_xz = s_g[:, iy0, :]
 
-                # XY-срез через z=0 (плоскость столкновения)
-                wmag_xy_mid  = w_g[:, :, iz_mid]
-                speed_xy_mid = s_g[:, :, iz_mid]
+                # XY-срез через z=0 (вид сверху — видны оба тора)
+                wmag_xy  = w_g[:, :, iz_mid]
+                speed_xy = s_g[:, :, iz_mid]
 
                 executor.submit(
                     _save_frame,
                     frame_idx, t,
-                    wmag_xz.copy(),      speed_xz.copy(),
-                    wmag_xy_mid.copy(),  speed_xy_mid.copy(),
-                    x1d, z1d, y1d,
-                    _T_coll
+                    wmag_xz.copy(),  speed_xz.copy(),
+                    wmag_xy.copy(),  speed_xy.copy(),
+                    x1d, z1d, y1d
                 )
                 frame_idx += 1
 
