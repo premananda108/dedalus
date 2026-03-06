@@ -1,34 +1,35 @@
 """
 rotating_tori_interaction.py
 ═══════════════════════════════════════════════════════════════════════
-ДВА ВРАЩАЮЩИХСЯ ТОРА: РАСКРУТКА → СВОБОДНОЕ ДВИЖЕНИЕ → ВЗАИМОДЕЙСТВИЕ
-3D несжимаемые уравнения Навье–Стокса + временная сила удержания
+ДВА СТАБИЛЬНЫХ ПОДВИЖНЫХ ТОРА, ВЗАИМОДЕЙСТВУЮЩИХ ЧЕРЕЗ ГАЗОВЫЕ ПОТОКИ
+3D несжимаемые уравнения Навье–Стокса + погружённые тела
 
 ФИЗИКА:
-  ФАЗА 1 — РАСКРУТКА (t < t_spinup):
-    Релаксационная сила F = γ·(u_target − u) раскручивает торы
-    до целевой скорости. Торы набирают вихревость и импульс.
+  • Каждый тор — «погружённое тело» (immersed boundary).
+    Релаксационная сила F = γ·(u_target − u) поддерживает вращение
+    ПОСТОЯННО. Торы никогда не распадаются.
 
-  ФАЗА 2 — ЗАТУХАНИЕ СИЛЫ (t_spinup < t < t_spinup + t_fade):
-    Сила плавно выключается (косинусный переход).
+  • Торы ПОДВИЖНЫ: их центры перемещаются под действием газовых
+    потоков, создаваемых другим тором. Каждый шаг по времени:
+      1) Вычисляем среднюю скорость потока в области тора
+      2) Обновляем скорость центра: v += (F_flow / m_eff) · dt
+      3) Перемещаем центр: pos += v · dt
+      4) Пересчитываем маску и целевую скорость на новой позиции
 
-  ФАЗА 3 — СВОБОДНЫЙ ПОЛЁТ (t > t_spinup + t_fade):
-    Торы движутся только по Навье–Стоксу. Их вращение создаёт
-    потоки газа. Потоки двух торов пересекаются → взаимодействие.
+  • ВЗАИМОДЕЙСТВИЕ через эффект Бернулли:
+      Со-вращение → ускорение потока → падение давления → ПРИТЯЖЕНИЕ
+      Контр-вращение → торможение потока → рост давления → ОТТАЛКИВАНИЕ
 
-  СТАБИЛЬНОСТЬ ПОСЛЕ ОТКЛЮЧЕНИЯ:
-    • Высокий Re → медленная вязкая диссипация
-    • Тороидальный вихрь — устойчивая структура (как дымовое кольцо)
-    • Полоидальный вихрь с нулевой нетто-циркуляцией → нет дрейфа
+  • ЭФФЕКТИВНАЯ МАССА m_eff определяет инерцию тора.
+    Большая масса → медленная реакция → «тяжёлый» тор.
 
-ВЫВОД:
-  frames_rotating_tori/*.png           — PNG-кадры
-  snapshots_rotating_tori/*.h5         — HDF5-снапшоты
-  vtk_output_rotating_tori/*.pvd       — для ParaView
+РАСПОЛОЖЕНИЕ:
+  Тор A: верхний (z > 0)
+  Тор B: нижний (z < 0)
+  Оба на оси x=0, y=0
 
 ЗАПУСК:
   python3 rotating_tori_interaction.py
-  mpiexec -n 4 python3 rotating_tori_interaction.py
 ═══════════════════════════════════════════════════════════════════════
 """
 import os
@@ -54,41 +55,40 @@ VTK_DIR    = os.path.join(SCRIPT_DIR, "vtk_output_rotating_tori")
 os.makedirs(FRAMES_DIR, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════
-# §1. ПАРАМЕТРЫ ЗАДАЧИ
+# §1. ПАРАМЕТРЫ
 # ═══════════════════════════════════════════════════════
 
-# ── Геометрия ───────────────────────────────────────────
-Lx = Ly = Lz = 4 * np.pi          # увеличенный домен
-Nx = Ny = Nz = 64                 # 64³; для красоты 96
+Lx = Ly = Lz = 4 * np.pi
+Nx = Ny = Nz = 64
 dealias = 3 / 2
 
-# ── Вязкость ────────────────────────────────────────────
-Re  = 10000.0    # ВЫСОКИЙ Re → торы живут долго после отключения силы
+Re  = 5000.0
 nu  = 1.0 / Re
 
 # ── Параметры торов ─────────────────────────────────────
 R_ring = 1.2       # большой радиус
-a_core = 0.45      # малый радиус ядра
+a_core = 0.55      # малый радиус ядра
 
-# Расположение: два тора рядом по оси X, центрированы по Z
-d_sep   = 3.0 * R_ring    # расстояние между центрами ≈ 3.6
-x0_A    = -d_sep / 2
-x0_B    = +d_sep / 2
+# Начальные позиции: друг над другом по Z
+d_sep = 3.0 * R_ring
+pos_A = np.array([0.0, 0.0, +d_sep / 2])   # верхний тор
+pos_B = np.array([0.0, 0.0, -d_sep / 2])   # нижний тор
+vel_A = np.array([0.0, 0.0, 0.0])           # начальная скорость = 0
+vel_B = np.array([0.0, 0.0, 0.0])
 
 # ── Скорости вращения ──────────────────────────────────
-Omega_tor = 10.0   # тороидальное вращение (главный мотор)
-Omega_pol = 4.0    # полоидальное вращение (насос)
+Omega_tor = 10.0   # тороидальное вращение
+Omega_pol = 3.0    # полоидальное (внутри трубки)
 sign_A = +1
-sign_B = -1        # одинаковое направление; -1 для встречного
+sign_B = -1        # +1/+1 → со-вращение → притяжение
+                   # +1/-1 → контр-вращение → отталкивание
 
-# ── Фазы симуляции ─────────────────────────────────────
-tau_relax = 0.3    # жёсткость удержания
-t_spinup  = 0.5    # время раскрутки (достаточно для установления вихря)
-t_fade    = 0.25    # время плавного выключения силы
-# t > t_spinup + t_fade = 2.0 → свободный полёт
+# ── Сила удержания и масса ─────────────────────────────
+tau_relax = 0.15   # время релаксации (маленькое → жёсткое удержание)
+m_eff     = 5.0    # эффективная масса тора (больше → инертнее)
 
 # ── Интегратор ──────────────────────────────────────────
-stop_sim_time = 3.0     # долго: видим раскрутку + свободное движение
+stop_sim_time = 3.0
 max_timestep  = 4e-3
 dtype = np.float64
 
@@ -107,80 +107,116 @@ p     = dist.Field(name='p', bases=bases)
 u     = dist.VectorField(coords, name='u', bases=bases)
 tau_p = dist.Field(name='tau_p')
 
-# Поля для силы удержания
 gamma_field = dist.Field(name='gamma_field', bases=bases)
 u_target    = dist.VectorField(coords, name='u_target', bases=bases)
-amp         = dist.Field(name='amp')         # амплитуда силы (1→0)
-amp['g']    = 1.0
 
 x, y, z = dist.local_grids(xbasis, ybasis, zbasis)
+Nx_g, Ny_g, Nz_g = x.shape[0], y.shape[1], z.shape[2]
 
 # ═══════════════════════════════════════════════════════
-# §3. ЦЕЛЕВОЕ ПОЛЕ СКОРОСТИ И МАСКА
+# §3. ФУНКЦИИ РАСЧЁТА МАСКИ И ЦЕЛЕВОЙ СКОРОСТИ
 # ═══════════════════════════════════════════════════════
 
-Nx_g = x.shape[0]
-Ny_g = y.shape[1]
-Nz_g = z.shape[2]
-
-
-def compute_torus_velocity(Omega_t, Omega_p, sign, x0,
-                           x_g, y_g, z_g, R=R_ring, a=a_core):
-    """
-    Целевая скорость одного тора: тороидальное + полоидальное вращение.
-    Тор центрирован на (x0, 0, 0), ось ê_z.
-    """
-    x_loc = x_g - x0
-    y_loc = y_g
-    r_loc  = np.sqrt(x_loc**2 + y_loc**2)
-    r_safe = np.maximum(r_loc, 1e-12)
-
-    # s² — расстояние до оси трубки
-    s2 = (r_loc - R)**2 + z_g**2
-    envelope = np.exp(-s2 / a**2)
-
-    # ── Тороидальная скорость ──────────────────────────
-    u_phi = sign * Omega_t * envelope
-    ux_tor = -u_phi * (y_loc / r_safe)
-    uy_tor =  u_phi * (x_loc / r_safe)
-
-    # ── Полоидальная скорость (нулевая нетто-циркуляция) ─
-    s = np.sqrt(s2 + 1e-24)
-    dr = r_loc - R
-    vpol_mag = sign * Omega_p * (2.0 * s / a) * np.exp(-s2 / a**2)
-
-    s_safe = np.maximum(s, 1e-12)
-    ux_pol = -vpol_mag * z_g * (x_loc / r_safe) / s_safe
-    uy_pol = -vpol_mag * z_g * (y_loc / r_safe) / s_safe
-    uz_pol =  vpol_mag * dr / s_safe
-
-    return (ux_tor + ux_pol, uy_tor + uy_pol, uz_pol)
-
-
-def compute_torus_mask(x0, x_g, y_g, z_g, R=R_ring, a=a_core):
-    """Гауссова маска в ядре тора."""
-    x_loc = x_g - x0
-    r_loc = np.sqrt(x_loc**2 + y_g**2)
-    s2 = (r_loc - R)**2 + z_g**2
+def torus_mask(cx, cy, cz, x_g, y_g, z_g, R=R_ring, a=a_core):
+    """Гауссова маска ядра тора с центром (cx, cy, cz)."""
+    dx = x_g - cx
+    dy = y_g - cy
+    dz = z_g - cz
+    r_cyl = np.sqrt(dx**2 + dy**2)
+    s2 = (r_cyl - R)**2 + dz**2
     return np.exp(-s2 / a**2)
 
 
-# ── Маска γ(x) ────────────────────────────────────────
-mask_A = compute_torus_mask(x0_A, x, y, z)
-mask_B = compute_torus_mask(x0_B, x, y, z)
-gamma_field['g'] = (mask_A + mask_B) / tau_relax
+def torus_velocity(Omega_t, Omega_p, sign, cx, cy, cz,
+                   x_g, y_g, z_g, R=R_ring, a=a_core):
+    """Целевая скорость тора: тороидальное + полоидальное вращение."""
+    dx = x_g - cx
+    dy = y_g - cy
+    dz = z_g - cz
+    r_cyl  = np.sqrt(dx**2 + dy**2)
+    r_safe = np.maximum(r_cyl, 1e-12)
 
-# ── Целевая скорость ───────────────────────────────────
-ux_A, uy_A, uz_A = compute_torus_velocity(
-    Omega_tor, Omega_pol, sign_A, x0_A, x, y, z)
-ux_B, uy_B, uz_B = compute_torus_velocity(
-    Omega_tor, Omega_pol, sign_B, x0_B, x, y, z)
+    s2 = (r_cyl - R)**2 + dz**2
+    envelope = np.exp(-s2 / a**2)
 
-u_target['g'][0] = ux_A + ux_B
-u_target['g'][1] = uy_A + uy_B
-u_target['g'][2] = uz_A + uz_B
+    # Тороидальное: u_φ · ê_φ
+    u_phi = sign * Omega_t * envelope
+    ux = -u_phi * (dy / r_safe)
+    uy =  u_phi * (dx / r_safe)
 
-# ── Начальное условие = целевой профиль ────────────────
+    # Полоидальное: вращение внутри трубки (нулевая нетто-циркуляция)
+    s = np.sqrt(s2 + 1e-24)
+    dr = r_cyl - R
+    vpol = sign * Omega_p * (2.0 * s / a) * np.exp(-s2 / a**2)
+    s_safe = np.maximum(s, 1e-12)
+    ux += -vpol * dz * (dx / r_safe) / s_safe
+    uy += -vpol * dz * (dy / r_safe) / s_safe
+    uz  =  vpol * dr / s_safe
+
+    return ux, uy, uz
+
+
+def update_fields(pA, pB):
+    """Пересчитать gamma_field и u_target для текущих позиций торов."""
+    gamma_field.change_scales(1)
+    u_target.change_scales(1)
+    mA = torus_mask(pA[0], pA[1], pA[2], x, y, z)
+    mB = torus_mask(pB[0], pB[1], pB[2], x, y, z)
+    gamma_field['g'] = (mA + mB) / tau_relax
+
+    uxA, uyA, uzA = torus_velocity(
+        Omega_tor, Omega_pol, sign_A, pA[0], pA[1], pA[2], x, y, z)
+    uxB, uyB, uzB = torus_velocity(
+        Omega_tor, Omega_pol, sign_B, pB[0], pB[1], pB[2], x, y, z)
+
+    u_target['g'][0] = uxA + uxB
+    u_target['g'][1] = uyA + uyB
+    u_target['g'][2] = uzA + uzB
+
+
+def compute_drift_force(u_field, pos, sign_t):
+    """
+    Вычисляет силу на тор из газовых потоков.
+
+    Метод: усредняем скорость по объёму ядра тора (взвешенную маской),
+    вычитаем собственную скорость вращения → получаем «внешний поток»
+    (от другого тора и от взаимодействия). Этот поток создаёт силу.
+    """
+    cx, cy, cz = pos
+    mask = torus_mask(cx, cy, cz, x, y, z)
+    mask_sum = float(np.sum(mask)) + 1e-30
+
+    # Приводим u к стандартному масштабу (64³), чтобы совпало с маской x,y,z
+    u_field.change_scales(1)
+
+    # Средняя скорость потока в области тора
+    u_mean = np.array([
+        float(np.sum(u_field['g'][0] * mask)) / mask_sum,
+        float(np.sum(u_field['g'][1] * mask)) / mask_sum,
+        float(np.sum(u_field['g'][2] * mask)) / mask_sum,
+    ])
+
+    # Вычитаем собственную скорость вращения (она не должна двигать тор)
+    ux_self, uy_self, uz_self = torus_velocity(
+        Omega_tor, Omega_pol, sign_t, cx, cy, cz, x, y, z)
+    u_self_mean = np.array([
+        float(np.sum(ux_self * mask)) / mask_sum,
+        float(np.sum(uy_self * mask)) / mask_sum,
+        float(np.sum(uz_self * mask)) / mask_sum,
+    ])
+
+    # Внешний поток = полный − собственный
+    u_ext = u_mean - u_self_mean
+
+    # Сила ∝ внешний поток (drag-like)
+    drag_coeff = mask_sum * 0.1   # коэффициент связи с потоком
+    force = drag_coeff * u_ext
+
+    return force
+
+
+# ── Инициализация полей ────────────────────────────────
+update_fields(pos_A, pos_B)
 u['g'][0] = u_target['g'][0].copy()
 u['g'][1] = u_target['g'][1].copy()
 u['g'][2] = u_target['g'][2].copy()
@@ -189,16 +225,12 @@ _u_max0 = float(np.max(np.sqrt(u['g'][0]**2 + u['g'][1]**2 + u['g'][2]**2)))
 logger.info(f"Начальный max|u| = {_u_max0:.3f}")
 
 # ═══════════════════════════════════════════════════════
-# §4. УРАВНЕНИЯ НАВЬЕ–СТОКСА + ОТКЛЮЧАЕМАЯ СИЛА
-#
-#   ∂u/∂t + (u·∇)u = −∇p + ν∇²u + amp · γ(x) · (u_target − u)
-#                                     ↑
-#                               amp: 1→0 (выключается)
+# §4. УРАВНЕНИЯ (сила ВСЕГДА включена)
 # ═══════════════════════════════════════════════════════
 problem = d3.IVP([u, p, tau_p], namespace=locals())
 problem.add_equation(
     "dt(u) + grad(p) - nu*lap(u) = "
-    "-u@grad(u) + amp * gamma_field * (u_target - u)"
+    "-u@grad(u) + gamma_field*(u_target - u)"
 )
 problem.add_equation("div(u) + tau_p = 0")
 problem.add_equation("integ(p) = 0")
@@ -214,38 +246,28 @@ speed       = np.sqrt(u @ u)
 wmag        = np.sqrt(omega_field @ omega_field)
 
 # ═══════════════════════════════════════════════════════
-# §6. ВИЗУАЛИЗАЦИЯ КАДРОВ
+# §6. ВИЗУАЛИЗАЦИЯ
 # ═══════════════════════════════════════════════════════
-def _save_frame(frame_idx, t, current_amp,
-                wmag_xz, speed_xz, wmag_xy, speed_xy,
-                x1d, z1d, y1d):
-    """Сохраняет PNG-кадр с 4 панелями."""
-    BG = '#0a0a12'
+def _save_frame(frame_idx, t,
+                wmag_xz, speed_xz, w_g, s_g,
+                x1d, z1d, y1d,
+                pA, pB, track_A, track_B):
+    """PNG-кадр: 4 панели + траектории торов."""
+    BG = '#08081a'
     fig, axes = plt.subplots(2, 2, figsize=(13, 10), facecolor=BG)
 
-    # Определяем фазу
-    t_free = t_spinup + t_fade
-    if t < t_spinup:
-        phase_str = "РАСКРУТКА"
-        phase_clr = '#00ff88'
-    elif t < t_free:
-        phase_str = f"ЗАТУХАНИЕ СИЛЫ ({current_amp*100:.0f}%)"
-        phase_clr = '#ffaa00'
-    else:
-        phase_str = "СВОБОДНОЕ ДВИЖЕНИЕ"
-        phase_clr = '#ff4444'
-
     fig.suptitle(
-        f"Вращающиеся торы   |   t = {t:.3f}   |   [{phase_str}]\n"
-        f"Re = {Re:.0f}   |   Ω_tor = {Omega_tor}   Ω_pol = {Omega_pol}   "
-        f"|   d = {d_sep:.1f}",
-        fontsize=11, fontweight='bold', color=phase_clr, y=0.98
+        f"Стабильные торы — газовое взаимодействие   |   t = {t:.3f}\n"
+        f"Re={Re:.0f}   Ω_tor={Omega_tor}   m_eff={m_eff}   "
+        f"z_A={pA[2]:.2f}   z_B={pB[2]:.2f}   "
+        f"Δz={abs(pA[2]-pB[2]):.2f}",
+        fontsize=11, fontweight='bold', color='#66ccff', y=0.98
     )
 
     for ax in axes.flat:
         ax.set_facecolor(BG)
-        for spine in ax.spines.values():
-            spine.set_edgecolor('#2a2a3a')
+        for sp in ax.spines.values():
+            sp.set_edgecolor('#2a2a3a')
         ax.tick_params(colors='#777799', labelsize=8)
         ax.xaxis.label.set_color('#aaaacc')
         ax.yaxis.label.set_color('#aaaacc')
@@ -260,49 +282,59 @@ def _save_frame(frame_idx, t, current_amp,
     vmax_w = np.percentile(np.abs(wmag_xz), 99.5) + 1e-8
     vmax_s = np.percentile(np.abs(speed_xz), 99.5) + 1e-8
 
-    # [0,0] |ω| XZ
+    # ── [0,0] |ω| XZ + траектории ─────────────
     im0 = axes[0, 0].imshow(wmag_xz.T, cmap='inferno',
                              vmin=0, vmax=vmax_w, **kw_xz)
     axes[0, 0].set_title("|ω|  завихрённость  (XZ, y=0)",
                           color='white', fontsize=10)
     axes[0, 0].set_xlabel("x"); axes[0, 0].set_ylabel("z")
-    axes[0, 0].axvline(x0_A, color='#00d4ff', lw=0.6, ls='--', alpha=0.4)
-    axes[0, 0].axvline(x0_B, color='#ff6b6b', lw=0.6, ls='--', alpha=0.4)
+    # Траектории
+    tA = np.array(track_A)
+    tB = np.array(track_B)
+    if len(tA) > 1:
+        axes[0, 0].plot(tA[:, 0], tA[:, 2], '-', color='#00d4ff',
+                        lw=1.0, alpha=0.7, label='Тор A')
+        axes[0, 0].plot(tB[:, 0], tB[:, 2], '-', color='#ff6b6b',
+                        lw=1.0, alpha=0.7, label='Тор B')
+    axes[0, 0].plot(pA[0], pA[2], 'o', color='#00d4ff', ms=5)
+    axes[0, 0].plot(pB[0], pB[2], 'o', color='#ff6b6b', ms=5)
     cb = plt.colorbar(im0, ax=axes[0, 0])
     plt.setp(cb.ax.get_yticklabels(), color='#888888')
 
-    # [0,1] |u| XZ
+    # ── [0,1] |u| XZ ─────────────────────────
     im1 = axes[0, 1].imshow(speed_xz.T, cmap='magma',
                              vmin=0, vmax=vmax_s, **kw_xz)
     axes[0, 1].set_title("|u|  скорость  (XZ, y=0)",
                           color='white', fontsize=10)
     axes[0, 1].set_xlabel("x"); axes[0, 1].set_ylabel("z")
-    axes[0, 1].axvline(x0_A, color='#00d4ff', lw=0.6, ls='--', alpha=0.4)
-    axes[0, 1].axvline(x0_B, color='#ff6b6b', lw=0.6, ls='--', alpha=0.4)
+    axes[0, 1].axhline(pA[2], color='#00d4ff', lw=0.6, ls='--', alpha=0.4)
+    axes[0, 1].axhline(pB[2], color='#ff6b6b', lw=0.6, ls='--', alpha=0.4)
     cb = plt.colorbar(im1, ax=axes[0, 1])
     plt.setp(cb.ax.get_yticklabels(), color='#888888')
 
-    # [1,0] |ω| XY
-    vmax_w_xy = np.percentile(np.abs(wmag_xy), 99.5) + 1e-8
-    im2 = axes[1, 0].imshow(wmag_xy.T, cmap='inferno',
+    # ── [1,0] |ω| XY (срез через тор A) ──────
+    iz_A = int(np.argmin(np.abs(z1d - pA[2])))
+    iz_A = max(0, min(iz_A, w_g.shape[2] - 1))
+    wmag_xy_A = w_g[:, :, iz_A]
+    vmax_w_xy = np.percentile(np.abs(wmag_xy_A), 99.5) + 1e-8
+    im2 = axes[1, 0].imshow(wmag_xy_A.T, cmap='inferno',
                              vmin=0, vmax=vmax_w_xy, **kw_xy)
-    axes[1, 0].set_title("|ω|  завихрённость  (XY, z=0 — вид сверху)",
-                          color='white', fontsize=10)
+    axes[1, 0].set_title(f"|ω|  (XY, z={pA[2]:.1f} — тор A)",
+                          color='#00d4ff', fontsize=10)
     axes[1, 0].set_xlabel("x"); axes[1, 0].set_ylabel("y")
-    axes[1, 0].axvline(x0_A, color='#00d4ff', lw=0.6, ls='--', alpha=0.4)
-    axes[1, 0].axvline(x0_B, color='#ff6b6b', lw=0.6, ls='--', alpha=0.4)
     cb = plt.colorbar(im2, ax=axes[1, 0])
     plt.setp(cb.ax.get_yticklabels(), color='#888888')
 
-    # [1,1] |u| XY
-    vmax_s_xy = np.percentile(np.abs(speed_xy), 99.5) + 1e-8
-    im3 = axes[1, 1].imshow(speed_xy.T, cmap='magma',
-                             vmin=0, vmax=vmax_s_xy, **kw_xy)
-    axes[1, 1].set_title("|u|  скорость  (XY, z=0 — вид сверху)",
-                          color='white', fontsize=10)
+    # ── [1,1] |ω| XY (срез через тор B) ──────
+    iz_B = int(np.argmin(np.abs(z1d - pB[2])))
+    iz_B = max(0, min(iz_B, w_g.shape[2] - 1))
+    wmag_xy_B = w_g[:, :, iz_B]
+    vmax_w_xyB = np.percentile(np.abs(wmag_xy_B), 99.5) + 1e-8
+    im3 = axes[1, 1].imshow(wmag_xy_B.T, cmap='inferno',
+                             vmin=0, vmax=vmax_w_xyB, **kw_xy)
+    axes[1, 1].set_title(f"|ω|  (XY, z={pB[2]:.1f} — тор B)",
+                          color='#ff6b6b', fontsize=10)
     axes[1, 1].set_xlabel("x"); axes[1, 1].set_ylabel("y")
-    axes[1, 1].axvline(x0_A, color='#00d4ff', lw=0.6, ls='--', alpha=0.4)
-    axes[1, 1].axvline(x0_B, color='#ff6b6b', lw=0.6, ls='--', alpha=0.4)
     cb = plt.colorbar(im3, ax=axes[1, 1])
     plt.setp(cb.ax.get_yticklabels(), color='#888888')
 
@@ -314,7 +346,7 @@ def _save_frame(frame_idx, t, current_amp,
 
 
 # ═══════════════════════════════════════════════════════
-# §7. ЭКСПОРТ VTK + PVD
+# §7. ЭКСПОРТ VTK
 # ═══════════════════════════════════════════════════════
 def export_vtk(snap_dir=SNAP_DIR, vtk_dir=VTK_DIR,
                lx=Lx, ly=Ly, lz=Lz):
@@ -331,63 +363,61 @@ def export_vtk(snap_dir=SNAP_DIR, vtk_dir=VTK_DIR,
     if not h5_files:
         logger.warning(f"Нет .h5 файлов в {snap_dir}"); return
 
-    pvd_entries   = []
-    frame_counter = 0
+    pvd_entries = []
+    fc = 0
     logger.info(f"VTK-экспорт → {vtk_dir}/")
 
-    for file_path in h5_files:
-        with h5py.File(file_path, 'r') as f:
-            times            = f['scales/sim_time'][:]
+    for fp in h5_files:
+        with h5py.File(fp, 'r') as f:
+            times = f['scales/sim_time'][:]
             _, Nx_, Ny_, Nz_ = f['tasks/speed'].shape
-            dx = lx / Nx_; dy = ly / Ny_; dz = lz / Nz_
-
+            dx = lx/Nx_; dy = ly/Ny_; dz = lz/Nz_
             for i in range(len(times)):
-                t_val = float(times[i])
+                tv = float(times[i])
                 grid = pv.ImageData()
                 grid.dimensions = (Nx_, Ny_, Nz_)
-                grid.spacing    = (dx, dy, dz)
-                grid.origin     = (-lx/2, -ly/2, -lz/2)
-                grid.point_data["speed"]         = f['tasks/speed'][i].flatten(order="F")
+                grid.spacing = (dx, dy, dz)
+                grid.origin = (-lx/2, -ly/2, -lz/2)
+                grid.point_data["speed"] = f['tasks/speed'][i].flatten(order="F")
                 grid.point_data["vorticity_mag"] = f['tasks/vorticity_mag'][i].flatten(order="F")
-                grid.point_data["pressure"]      = f['tasks/pressure'][i].flatten(order="F")
+                grid.point_data["pressure"] = f['tasks/pressure'][i].flatten(order="F")
                 uv = f['tasks/velocity'][i]
                 grid.point_data["velocity"] = np.stack([
                     uv[0].flatten(order="F"),
                     uv[1].flatten(order="F"),
                     uv[2].flatten(order="F"),
                 ], axis=1)
-                vti_name = f"rotating_tori_{frame_counter:04d}.vti"
-                grid.save(os.path.join(vtk_dir, vti_name))
-                pvd_entries.append((t_val, vti_name))
-                frame_counter += 1
+                vn = f"rotating_tori_{fc:04d}.vti"
+                grid.save(os.path.join(vtk_dir, vn))
+                pvd_entries.append((tv, vn))
+                fc += 1
 
     with open(pvd_path, "w", encoding="utf-8") as pvd:
         pvd.write('<?xml version="1.0"?>\n')
         pvd.write('<VTKFile type="Collection" version="0.1" byte_order="LittleEndian">\n')
         pvd.write('  <Collection>\n')
-        for t_e, vti_name in pvd_entries:
-            pvd.write(f'    <DataSet timestep="{t_e:.6f}" group="" part="0" file="{vti_name}"/>\n')
+        for te, vn in pvd_entries:
+            pvd.write(f'    <DataSet timestep="{te:.6f}" group="" part="0" file="{vn}"/>\n')
         pvd.write('  </Collection>\n')
         pvd.write('</VTKFile>\n')
-
-    logger.info(f"✅  VTK: {frame_counter} кадров  →  {pvd_path}")
+    logger.info(f"✅  VTK: {fc} кадров  →  {pvd_path}")
 
 
 # ═══════════════════════════════════════════════════════
-# §8. ГЛАВНЫЙ ЦИКЛ ИНТЕГРИРОВАНИЯ
+# §8. ГЛАВНЫЙ ЦИКЛ
 # ═══════════════════════════════════════════════════════
 if __name__ == '__main__':
 
-    # ── HDF5-снапшоты ──────────────────────────────────
+    # HDF5-снапшоты
     snapshots = solver.evaluator.add_file_handler(
-        SNAP_DIR, sim_dt=0.1, max_writes=500
+        SNAP_DIR, sim_dt=0.2, max_writes=500
     )
-    snapshots.add_task(speed,  name="speed")
-    snapshots.add_task(wmag,   name="vorticity_mag")
-    snapshots.add_task(p,      name="pressure")
-    snapshots.add_task(u,      name="velocity")
+    snapshots.add_task(speed, name="speed")
+    snapshots.add_task(wmag,  name="vorticity_mag")
+    snapshots.add_task(p,     name="pressure")
+    snapshots.add_task(u,     name="velocity")
 
-    # ── CFL ────────────────────────────────────────────
+    # CFL
     CFL = d3.CFL(
         solver, initial_dt=max_timestep, cadence=10,
         safety=0.25, threshold=0.1,
@@ -395,7 +425,7 @@ if __name__ == '__main__':
     )
     CFL.add_velocity(u)
 
-    # ── Мониторинг ─────────────────────────────────────
+    # Мониторинг
     flow = d3.GlobalFlowProperty(solver, cadence=10)
     flow.add_property(speed, name='speed')
     flow.add_property(wmag,  name='omega')
@@ -403,85 +433,101 @@ if __name__ == '__main__':
     x1d = x[:, 0, 0]
     y1d = y[0, :, 0]
     z1d = z[0, 0, :]
-    iy0    = int(Ny_g // 2)
-    iz_mid = int(Nz_g // 2)
+    iy0 = int(Ny_g // 2)
 
-    t_free = t_spinup + t_fade
+    # Траектории центров торов (для визуализации)
+    track_A = [pos_A.copy()]
+    track_B = [pos_B.copy()]
 
     logger.info("═══════════════════════════════════════════════════════")
-    logger.info(" ВРАЩАЮЩИЕСЯ ТОРЫ: РАСКРУТКА → СВОБОДНОЕ ДВИЖЕНИЕ")
+    logger.info(" СТАБИЛЬНЫЕ ПОДВИЖНЫЕ ТОРЫ — Dedalus v3")
     logger.info(f" R={R_ring}, a={a_core}, Re={Re:.0f}")
-    logger.info(f" Тор A: x₀={x0_A:.2f}   Тор B: x₀={x0_B:.2f}")
     logger.info(f" Ω_tor={Omega_tor}, Ω_pol={Omega_pol}")
-    logger.info(f" Раскрутка: 0 → {t_spinup:.1f}")
-    logger.info(f" Затухание силы: {t_spinup:.1f} → {t_free:.1f}")
-    logger.info(f" Свободный полёт: {t_free:.1f} → {stop_sim_time:.1f}")
-    logger.info(f" PNG-кадры: {FRAMES_DIR}/")
+    logger.info(f" sign_A={sign_A:+d}, sign_B={sign_B:+d}")
+    logger.info(f" m_eff={m_eff}, τ_relax={tau_relax}")
+    logger.info(f" Тор A: z₀={pos_A[2]:.2f}   Тор B: z₀={pos_B[2]:.2f}")
+    logger.info(f" Δz₀={abs(pos_A[2]-pos_B[2]):.2f}")
+    logger.info(f" Время: {stop_sim_time:.1f}")
     logger.info("═══════════════════════════════════════════════════════")
 
     frame_idx = 0
-    executor  = ThreadPoolExecutor(max_workers=2)
+    executor = ThreadPoolExecutor(max_workers=2)
 
     try:
         while solver.proceed:
             t = solver.sim_time
 
-            # ── ЛОГИКА ОТКЛЮЧЕНИЯ СИЛЫ ─────────────────
-            if t < t_spinup:
-                current_amp = 1.0
-            elif t < t_free:
-                # Плавный косинусный переход 1 → 0
-                phase = np.pi * (t - t_spinup) / t_fade
-                current_amp = 0.5 * (1.0 + np.cos(phase))
-            else:
-                current_amp = 0.0
+            # ── 1. Вычисляем силу на каждый тор ───────
+            F_A = compute_drift_force(u, pos_A, sign_A)
+            F_B = compute_drift_force(u, pos_B, sign_B)
 
-            amp['g'] = current_amp
-            # ───────────────────────────────────────────
+            # ── 2. Обновляем скорости (F = ma) ────────
+            dt_sim = CFL.compute_timestep()
+            vel_A += (F_A / m_eff) * dt_sim
+            vel_B += (F_B / m_eff) * dt_sim
 
-            dt = CFL.compute_timestep()
-            solver.step(dt)
+            # Лёгкое демпфирование (стабилизация)
+            vel_A *= 0.999
+            vel_B *= 0.999
 
+            # ── 3. Перемещаем центры ──────────────────
+            pos_A += vel_A * dt_sim
+            pos_B += vel_B * dt_sim
+
+            # Ограничение: торы не выходят за домен
+            half = Lz / 2 - R_ring
+            pos_A[2] = np.clip(pos_A[2], -half, half)
+            pos_B[2] = np.clip(pos_B[2], -half, half)
+            pos_A[0] = np.clip(pos_A[0], -Lx/2 + R_ring, Lx/2 - R_ring)
+            pos_B[0] = np.clip(pos_B[0], -Lx/2 + R_ring, Lx/2 - R_ring)
+
+            # ── 4. Пересчитываем поля на новых позициях ─
+            update_fields(pos_A, pos_B)
+
+            # ── 5. Шаг Навье-Стокса ───────────────────
+            solver.step(dt_sim)
+
+            # Запись траекторий
+            if (solver.iteration - 1) % 5 == 0:
+                track_A.append(pos_A.copy())
+                track_B.append(pos_B.copy())
+
+            # ── Логирование и визуализация ────────────
             if (solver.iteration - 1) % 20 == 0:
                 max_speed = flow.max('speed')
                 max_omega = flow.max('omega')
-
-                # Фаза для лога
-                if t < t_spinup:
-                    ph = "РАСКРУТКА"
-                elif t < t_free:
-                    ph = f"ЗАТУХАНИЕ({current_amp:.2f})"
-                else:
-                    ph = "СВОБОДНЫЙ"
+                dz = abs(pos_A[2] - pos_B[2])
 
                 logger.info(
                     f"it={solver.iteration:5d} | t={t:6.3f} | "
-                    f"{ph:20s} | max|u|={max_speed:6.3f} | "
-                    f"max|ω|={max_omega:7.2f}"
+                    f"max|u|={max_speed:6.3f} | max|ω|={max_omega:7.2f} | "
+                    f"Δz={dz:.3f} | "
+                    f"zA={pos_A[2]:+.3f} zB={pos_B[2]:+.3f}"
                 )
 
-                # ── Вычисляем поля для кадра ───────────
-                w_ev = wmag.evaluate();  w_ev.change_scales(1)
+                w_ev = wmag.evaluate(); w_ev.change_scales(1)
                 s_ev = speed.evaluate(); s_ev.change_scales(1)
-
                 w_g = np.array(w_ev['g'])
                 s_g = np.array(s_ev['g'])
 
                 executor.submit(
-                    _save_frame, frame_idx, t, current_amp,
-                    w_g[:, iy0, :].copy(),   s_g[:, iy0, :].copy(),
-                    w_g[:, :, iz_mid].copy(), s_g[:, :, iz_mid].copy(),
-                    x1d, z1d, y1d
+                    _save_frame, frame_idx, t,
+                    w_g[:, iy0, :].copy(), s_g[:, iy0, :].copy(),
+                    w_g.copy(), s_g.copy(),
+                    x1d, z1d, y1d,
+                    pos_A.copy(), pos_B.copy(),
+                    list(track_A), list(track_B)
                 )
                 frame_idx += 1
 
     except Exception:
-        logger.exception("Ошибка в главном цикле.")
+        logger.exception("Ошибка.")
         raise
     finally:
         executor.shutdown(wait=True)
         solver.log_stats()
-        logger.info(f"✅  PNG-кадры: {frame_idx} → {FRAMES_DIR}/")
+        logger.info(f"✅  PNG: {frame_idx} → {FRAMES_DIR}/")
+        logger.info(f"   Финальные позиции: A={pos_A}, B={pos_B}")
+        logger.info(f"   Δz финальное = {abs(pos_A[2]-pos_B[2]):.4f}")
 
-    # ── VTK/PVD ────────────────────────────────────────
     export_vtk()
