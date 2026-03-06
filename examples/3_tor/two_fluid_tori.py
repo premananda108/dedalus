@@ -473,68 +473,6 @@ def _save_frame(fidx, t,
     return out
 
 
-# ═══════════════════════════════════════════════════════════════
-# §8. VTK-ЭКСПОРТ (опциональный, для ParaView)
-# ═══════════════════════════════════════════════════════════════
-def export_vtk(snap_dir=SNAP_DIR, vtk_dir=VTK_DIR,
-               lx=Lx, ly=Ly, lz=Lz):
-    """Конвертирует HDF5-снапшоты в VTK (.vti + .pvd) для ParaView."""
-    import glob, h5py
-    try:
-        import pyvista as pv
-    except ImportError:
-        logger.warning("pyvista не установлена — VTK-экспорт пропущен.")
-        return
-
-    os.makedirs(vtk_dir, exist_ok=True)
-    h5_files = sorted(glob.glob(os.path.join(snap_dir, "*.h5")))
-    if not h5_files:
-        logger.warning(f"Нет .h5 в {snap_dir}"); return
-
-    pvd_entries = []; fc = 0
-    for fp in h5_files:
-        with h5py.File(fp, 'r') as f:
-            times = f['scales/sim_time'][:]
-            _, Nx_, Ny_, Nz_ = f['tasks/speed'].shape
-            for i in range(len(times)):
-                tv = float(times[i])
-                grid = pv.ImageData()
-                grid.dimensions = (Nx_, Ny_, Nz_)
-                grid.spacing    = (lx/Nx_, ly/Ny_, lz/Nz_)
-                grid.origin     = (-lx/2, -ly/2, -lz/2)
-                grid.point_data["speed"]    = \
-                    f['tasks/speed'][i].flatten(order="F")
-                grid.point_data["vort_mag"] = \
-                    f['tasks/vorticity_mag'][i].flatten(order="F")
-                grid.point_data["pressure"] = \
-                    f['tasks/pressure'][i].flatten(order="F")
-                grid.point_data["phi_A"]    = \
-                    f['tasks/phi_A'][i].flatten(order="F")
-                grid.point_data["phi_B"]    = \
-                    f['tasks/phi_B'][i].flatten(order="F")
-                grid.point_data["phi_total"]= \
-                    f['tasks/phi_total'][i].flatten(order="F")
-                uv = f['tasks/velocity'][i]
-                grid.point_data["velocity"] = np.stack([
-                    uv[0].flatten(order="F"),
-                    uv[1].flatten(order="F"),
-                    uv[2].flatten(order="F"),
-                ], axis=1)
-                vn = f"two_fluid_{fc:04d}.vti"
-                grid.save(os.path.join(vtk_dir, vn))
-                pvd_entries.append((tv, vn)); fc += 1
-
-    pvd_path = os.path.join(vtk_dir, "two_fluid_tori.pvd")
-    with open(pvd_path, "w", encoding="utf-8") as pvd:
-        pvd.write('<?xml version="1.0"?>\n')
-        pvd.write('<VTKFile type="Collection" version="0.1"'
-                  ' byte_order="LittleEndian">\n  <Collection>\n')
-        for te, vn in pvd_entries:
-            pvd.write(f'    <DataSet timestep="{te:.6f}"'
-                      f' group="" part="0" file="{vn}"/>\n')
-        pvd.write('  </Collection>\n</VTKFile>\n')
-    logger.info(f"✅ VTK: {fc} кадров → {pvd_path}")
-
 
 # ═══════════════════════════════════════════════════════════════
 # §9. ГЛАВНЫЙ ЦИКЛ
@@ -677,5 +615,3 @@ if __name__ == '__main__':
             logger.info("   ✅  Оба тора СОХРАНИЛИ форму!")
         else:
             logger.warning("   ⚠️  Один или оба тора деградировали.")
-
-    export_vtk()

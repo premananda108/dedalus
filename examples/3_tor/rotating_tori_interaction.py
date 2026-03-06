@@ -62,7 +62,7 @@ Lx = Ly = Lz = 4 * np.pi
 Nx = Ny = Nz = 64
 dealias = 3 / 2
 
-Re  = 5000.0
+Re  = 10000.0
 nu  = 1.0 / Re
 
 # ── Параметры торов ─────────────────────────────────────
@@ -346,64 +346,6 @@ def _save_frame(frame_idx, t,
 
 
 # ═══════════════════════════════════════════════════════
-# §7. ЭКСПОРТ VTK
-# ═══════════════════════════════════════════════════════
-def export_vtk(snap_dir=SNAP_DIR, vtk_dir=VTK_DIR,
-               lx=Lx, ly=Ly, lz=Lz):
-    import glob, h5py
-    try:
-        import pyvista as pv
-    except ImportError:
-        logger.warning("pyvista не установлена — VTK-экспорт пропущен.")
-        return
-
-    pvd_path = os.path.join(vtk_dir, "rotating_tori.pvd")
-    os.makedirs(vtk_dir, exist_ok=True)
-    h5_files = sorted(glob.glob(os.path.join(snap_dir, "*.h5")))
-    if not h5_files:
-        logger.warning(f"Нет .h5 файлов в {snap_dir}"); return
-
-    pvd_entries = []
-    fc = 0
-    logger.info(f"VTK-экспорт → {vtk_dir}/")
-
-    for fp in h5_files:
-        with h5py.File(fp, 'r') as f:
-            times = f['scales/sim_time'][:]
-            _, Nx_, Ny_, Nz_ = f['tasks/speed'].shape
-            dx = lx/Nx_; dy = ly/Ny_; dz = lz/Nz_
-            for i in range(len(times)):
-                tv = float(times[i])
-                grid = pv.ImageData()
-                grid.dimensions = (Nx_, Ny_, Nz_)
-                grid.spacing = (dx, dy, dz)
-                grid.origin = (-lx/2, -ly/2, -lz/2)
-                grid.point_data["speed"] = f['tasks/speed'][i].flatten(order="F")
-                grid.point_data["vorticity_mag"] = f['tasks/vorticity_mag'][i].flatten(order="F")
-                grid.point_data["pressure"] = f['tasks/pressure'][i].flatten(order="F")
-                uv = f['tasks/velocity'][i]
-                grid.point_data["velocity"] = np.stack([
-                    uv[0].flatten(order="F"),
-                    uv[1].flatten(order="F"),
-                    uv[2].flatten(order="F"),
-                ], axis=1)
-                vn = f"rotating_tori_{fc:04d}.vti"
-                grid.save(os.path.join(vtk_dir, vn))
-                pvd_entries.append((tv, vn))
-                fc += 1
-
-    with open(pvd_path, "w", encoding="utf-8") as pvd:
-        pvd.write('<?xml version="1.0"?>\n')
-        pvd.write('<VTKFile type="Collection" version="0.1" byte_order="LittleEndian">\n')
-        pvd.write('  <Collection>\n')
-        for te, vn in pvd_entries:
-            pvd.write(f'    <DataSet timestep="{te:.6f}" group="" part="0" file="{vn}"/>\n')
-        pvd.write('  </Collection>\n')
-        pvd.write('</VTKFile>\n')
-    logger.info(f"✅  VTK: {fc} кадров  →  {pvd_path}")
-
-
-# ═══════════════════════════════════════════════════════
 # §8. ГЛАВНЫЙ ЦИКЛ
 # ═══════════════════════════════════════════════════════
 if __name__ == '__main__':
@@ -529,5 +471,3 @@ if __name__ == '__main__':
         logger.info(f"✅  PNG: {frame_idx} → {FRAMES_DIR}/")
         logger.info(f"   Финальные позиции: A={pos_A}, B={pos_B}")
         logger.info(f"   Δz финальное = {abs(pos_A[2]-pos_B[2]):.4f}")
-
-    export_vtk()
